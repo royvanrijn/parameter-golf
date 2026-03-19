@@ -119,6 +119,25 @@ VOCAB_SIZE=1024 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py
 ```
 
+If you want to run the same SVD-GPT architecture on both Mac (MLX) and CUDA (RunPod) without manually re-editing model flags, use the shared launch scripts:
+
+```bash
+# Mac / Apple Silicon path
+./scripts/train_svdgpt_mlx.sh
+
+# CUDA path (single GPU by default)
+./scripts/train_svdgpt_gpu.sh
+```
+
+The scripts share architecture + SVD env vars from `scripts/svdgpt_env.sh`, so changing those knobs once applies to both backends.
+
+For a fresh RunPod VM, you can also use:
+
+```bash
+./scripts/runpod_bootstrap.sh
+./scripts/runpod_train_svdgpt_gpu.sh
+```
+
 By default, `train_gpt.py` keeps its ~10 minute wallclock cap. If you want a longer run, override it explicitly, for example `MAX_WALLCLOCK_SECONDS=0`.
 
 By default, this command prints `train_loss` step logs during training and prints `val_loss`, `val_bpb`, and compressed model size in the final `final_int8_zlib_roundtrip` lines at the end. If you want periodic validation logs during the run, set `VAL_LOSS_EVERY`, for example `VAL_LOSS_EVERY=200`. For the baseline config, the final `val_bpb` should land around ~1.2 with a compressed model size under 16MB.
