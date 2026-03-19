@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -100,6 +101,13 @@ class Hyperparameters:
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
     svd_use_attn_proj = bool(int(os.environ.get("SVD_USE_ATTN_PROJ", "1")))
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
+    svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
+    svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
+    svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
+    svd_layer_stride = int(os.environ.get("SVD_LAYER_STRIDE", 1))
+    svd_parallel_streams = int(os.environ.get("SVD_PARALLEL_STREAMS", 1))
+    svd_adaptive_threshold = float(os.environ.get("SVD_ADAPTIVE_THRESHOLD", 0.0))
+    svd_adaptive_max_mats = int(os.environ.get("SVD_ADAPTIVE_MAX_MATS", 4))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -124,38 +132,109 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
-def truncated_svd_weight(weight: Tensor, rank: int, mix: float) -> Tensor:
+def low_rank_approx(arr: Tensor, rank: int, args: Hyperparameters) -> Tensor:
+    if args.svd_method == "full":
+        u, s, vh = torch.linalg.svd(arr, full_matrices=False)
+        return (u[:, :rank] * s[:rank]) @ vh[:rank, :]
+
+    q = min(arr.shape[0], arr.shape[1], rank + max(1, args.svd_oversample))
+    q = max(rank, q)
+    u, s, v = torch.svd_lowrank(arr, q=q, niter=max(0, int(args.svd_power_iters)))
+    return (u[:, :rank] * s[:rank]) @ v[:, :rank].T
+
+
+def truncated_svd_weight(weight: Tensor, rank: int, mix: float, args: Hyperparameters) -> tuple[Tensor, float]:
     out_dim, in_dim = weight.shape
     max_rank = min(out_dim, in_dim)
     rank = max(1, min(int(rank), max_rank))
     if rank >= max_rank:
-        return weight
+        return weight, 0.0
     arr = weight.detach().float()
-    u, s, vh = torch.linalg.svd(arr, full_matrices=False)
-    low_rank = (u[:, :rank] * s[:rank]) @ vh[:rank, :]
+    low_rank = low_rank_approx(arr, rank, args)
+    residual = float((arr - low_rank).norm() / (arr.norm() + 1e-8))
     if mix < 1.0:
         low_rank = (1.0 - mix) * arr + mix * low_rank
-    return low_rank.to(dtype=weight.dtype)
+    return low_rank.to(dtype=weight.dtype), residual
 
 
 @torch.no_grad()
-def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters) -> None:
-    if args.svd_every <= 0:
-        return
-    for block in model.blocks:
-        block.mlp.fc.weight.copy_(truncated_svd_weight(block.mlp.fc.weight, args.svd_rank_fc, args.svd_mix))
-        block.mlp.proj.weight.copy_(truncated_svd_weight(block.mlp.proj.weight, args.svd_rank_proj, args.svd_mix))
+def collect_svd_targets(model: nn.Module, args: Hyperparameters, step_1idx: int) -> list[tuple[Tensor, int]]:
+    layer_stride = max(1, int(args.svd_layer_stride))
+    period_idx = max(step_1idx - max(int(args.svd_start_step), 0), 0) // max(int(args.svd_every), 1)
+    layer_offset = period_idx % layer_stride
+    targets: list[tuple[Tensor, int]] = []
+    for layer_idx, block in enumerate(model.blocks):
+        if layer_stride > 1 and layer_idx % layer_stride != layer_offset:
+            continue
+        targets.append((block.mlp.fc.weight, args.svd_rank_fc))
+        targets.append((block.mlp.proj.weight, args.svd_rank_proj))
         if args.svd_use_attn_proj:
-            block.attn.proj.weight.copy_(
-                truncated_svd_weight(block.attn.proj.weight, args.svd_rank_attn_proj, args.svd_mix)
-            )
+            targets.append((block.attn.proj.weight, args.svd_rank_attn_proj))
+    return targets
 
 
-def should_apply_svd_projection(step_1idx: int, args: Hyperparameters) -> bool:
+@dataclass
+class SVDProjectionStats:
+    num_mats: int
+    avg_residual: float
+
+
+@torch.no_grad()
+def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters, step_1idx: int) -> SVDProjectionStats:
     if args.svd_every <= 0:
-        return False
+        return SVDProjectionStats(num_mats=0, avg_residual=0.0)
+    targets = collect_svd_targets(model, args, step_1idx)
+    if not targets:
+        return SVDProjectionStats(num_mats=0, avg_residual=0.0)
+
+    mats = len(targets)
+    outputs: list[tuple[Tensor, float] | None] = [None] * mats
+    stream_count = min(max(1, int(args.svd_parallel_streams)), mats)
+    device = targets[0][0].device
+    use_streams = stream_count > 1 and device.type == "cuda"
+    streams = [torch.cuda.Stream(device=device) for _ in range(stream_count)] if use_streams else []
+    if streams:
+        for idx, (weight, rank) in enumerate(targets):
+            with torch.cuda.stream(streams[idx % stream_count]):
+                outputs[idx] = truncated_svd_weight(weight, rank, args.svd_mix, args)
+        for stream in streams:
+            stream.synchronize()
+    else:
+        for idx, (weight, rank) in enumerate(targets):
+            outputs[idx] = truncated_svd_weight(weight, rank, args.svd_mix, args)
+
+    residual_sum = 0.0
+    for (weight, _), packed in zip(targets, outputs):
+        assert packed is not None
+        projected, residual = packed
+        weight.copy_(projected)
+        residual_sum += residual
+    return SVDProjectionStats(num_mats=mats, avg_residual=residual_sum / mats)
+
+
+@torch.no_grad()
+def should_apply_svd_projection(step_1idx: int, model: nn.Module, args: Hyperparameters) -> tuple[bool, float]:
+    if args.svd_every <= 0:
+        return False, 0.0
     start_step = max(int(args.svd_start_step), 0)
-    return step_1idx >= start_step and (step_1idx - start_step) % args.svd_every == 0
+    due = step_1idx >= start_step and (step_1idx - start_step) % args.svd_every == 0
+    if not due:
+        return False, 0.0
+    threshold = float(args.svd_adaptive_threshold)
+    if threshold <= 0:
+        return True, 0.0
+    sample_targets = collect_svd_targets(model, args, step_1idx)
+    max_mats = max(1, int(args.svd_adaptive_max_mats))
+    if len(sample_targets) > max_mats:
+        sample_targets = sample_targets[:max_mats]
+    if not sample_targets:
+        return False, 0.0
+    residual_sum = 0.0
+    for weight, rank in sample_targets:
+        _, residual = truncated_svd_weight(weight, rank, 1.0, args)
+        residual_sum += residual
+    avg_residual = residual_sum / len(sample_targets)
+    return avg_residual >= threshold, avg_residual
 
 
 class Muon(torch.optim.Optimizer):
@@ -863,7 +942,10 @@ def main() -> None:
     log0(
         f"svd_training: start_step={args.svd_start_step} every={args.svd_every} mix={args.svd_mix:.3f} "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
-        f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj}"
+        f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
+        f"method={args.svd_method} power_iters={args.svd_power_iters} oversample={args.svd_oversample} "
+        f"layer_stride={args.svd_layer_stride} parallel_streams={args.svd_parallel_streams} "
+        f"adaptive_threshold={args.svd_adaptive_threshold:.4f} adaptive_max_mats={args.svd_adaptive_max_mats}"
     )
     log0(f"seed:{args.seed}")
 
@@ -989,10 +1071,15 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if should_apply_svd_projection(step + 1, args):
+        apply_svd, adaptive_probe = should_apply_svd_projection(step + 1, base_model, args)
+        if apply_svd:
             svd_t0 = time.perf_counter()
-            apply_periodic_svd_projection(base_model, args)
-            log0(f"svd_projection step:{step + 1} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}", console=False)
+            svd_stats = apply_periodic_svd_projection(base_model, args, step + 1)
+            log0(
+                f"svd_projection step:{step + 1} mats:{svd_stats.num_mats} avg_residual:{svd_stats.avg_residual:.4f} "
+                f"adaptive_probe:{adaptive_probe:.4f} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
+                console=False,
+            )
         zero_grad_all()
 
         step += 1
