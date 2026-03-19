@@ -96,10 +96,15 @@ class Hyperparameters:
     svd_every = int(os.environ.get("SVD_EVERY", 0))
     svd_start_step = int(os.environ.get("SVD_START_STEP", 0))
     svd_mix = float(os.environ.get("SVD_MIX", 0.25))
-    svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
-    svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
-    svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
-    svd_use_attn_proj = bool(int(os.environ.get("SVD_USE_ATTN_PROJ", "1")))
+    lrp_rank_fc = int(os.environ.get("LRP_RANK_FC", os.environ.get("SVD_RANK_FC", 64)))
+    lrp_rank_proj = int(os.environ.get("LRP_RANK_PROJ", os.environ.get("SVD_RANK_PROJ", 64)))
+    lrp_rank_attn_proj = int(os.environ.get("LRP_RANK_ATTN_PROJ", os.environ.get("SVD_RANK_ATTN_PROJ", 64)))
+    lrp_use_attn_proj = bool(int(os.environ.get("LRP_USE_ATTN_PROJ", os.environ.get("SVD_USE_ATTN_PROJ", "1"))))
+    # Back-compat aliases for export helpers that still query SVD_* names.
+    svd_rank_fc = lrp_rank_fc
+    svd_rank_proj = lrp_rank_proj
+    svd_rank_attn_proj = lrp_rank_attn_proj
+    svd_use_attn_proj = lrp_use_attn_proj
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
     svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
@@ -909,9 +914,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        fc_rank=args.svd_rank_fc,
-        proj_rank=args.svd_rank_proj,
-        attn_proj_rank=args.svd_rank_attn_proj if args.svd_use_attn_proj else 0,
+        fc_rank=args.lrp_rank_fc,
+        proj_rank=args.lrp_rank_proj,
+        attn_proj_rank=args.lrp_rank_attn_proj if args.lrp_use_attn_proj else 0,
         lrp_scale=args.lrp_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -986,9 +991,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"low_rank_personalization: rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
-        f"rank_attn_proj={args.svd_rank_attn_proj if args.svd_use_attn_proj else 0} lrp_scale={args.lrp_scale:.3f}"
+        f"low_rank_personalization: rank_fc={args.lrp_rank_fc} rank_proj={args.lrp_rank_proj} "
+        f"rank_attn_proj={args.lrp_rank_attn_proj if args.lrp_use_attn_proj else 0} lrp_scale={args.lrp_scale:.3f}"
     )
+    if args.svd_every > 0:
+        log0("note: SVD_EVERY/SVD_* projection cadence knobs are ignored during training when low-rank personalization is enabled.")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
