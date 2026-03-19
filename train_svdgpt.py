@@ -108,6 +108,7 @@ class Hyperparameters:
     svd_parallel_streams = int(os.environ.get("SVD_PARALLEL_STREAMS", 1))
     svd_adaptive_threshold = float(os.environ.get("SVD_ADAPTIVE_THRESHOLD", 0.0))
     svd_adaptive_max_mats = int(os.environ.get("SVD_ADAPTIVE_MAX_MATS", 4))
+    lrp_scale = float(os.environ.get("LRP_SCALE", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -545,6 +546,35 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class LowRankPersonalizedLinear(nn.Module):
+    # Dense backbone + learned low-rank personalization delta.
+    def __init__(self, in_features: int, out_features: int, rank: int, scale: float, bias: bool = False, zero_init: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = max(0, int(rank))
+        self.scale = float(scale)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(out_features, dtype=torch.float32)) if bias else None
+        if self.rank > 0:
+            self.personal_u = nn.Parameter(torch.zeros(out_features, self.rank, dtype=torch.float32))
+            self.personal_v = nn.Parameter(torch.zeros(self.rank, in_features, dtype=torch.float32))
+        else:
+            self.register_parameter("personal_u", None)
+            self.register_parameter("personal_v", None)
+        self._zero_init = zero_init
+
+    def effective_weight(self, dtype: torch.dtype) -> Tensor:
+        if self.rank > 0 and self.personal_u is not None and self.personal_v is not None:
+            delta = self.personal_u @ self.personal_v
+            return (self.weight + self.scale * delta).to(dtype)
+        return self.weight.to(dtype)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.effective_weight(x.dtype), bias)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -592,6 +622,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        attn_proj_rank: int,
+        lrp_scale: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -607,8 +639,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        self.proj = LowRankPersonalizedLinear(dim, dim, rank=attn_proj_rank, scale=lrp_scale, bias=False, zero_init=True)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -637,12 +668,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, fc_rank: int, proj_rank: int, lrp_scale: float):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.fc = LowRankPersonalizedLinear(dim, hidden, rank=fc_rank, scale=lrp_scale, bias=False)
+        self.proj = LowRankPersonalizedLinear(hidden, dim, rank=proj_rank, scale=lrp_scale, bias=False, zero_init=True)
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
@@ -658,12 +688,16 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        fc_rank: int,
+        proj_rank: int,
+        attn_proj_rank: int,
+        lrp_scale: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_proj_rank, lrp_scale)
+        self.mlp = MLP(dim, mlp_mult, fc_rank, proj_rank, lrp_scale)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -691,6 +725,10 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        fc_rank: int,
+        proj_rank: int,
+        attn_proj_rank: int,
+        lrp_scale: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -712,6 +750,10 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    fc_rank,
+                    proj_rank,
+                    attn_proj_rank,
+                    lrp_scale,
                 )
                 for i in range(num_layers)
             ]
@@ -726,7 +768,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+            if hasattr(module, "weight") and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -867,10 +909,14 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        fc_rank=args.svd_rank_fc,
+        proj_rank=args.svd_rank_proj,
+        attn_proj_rank=args.svd_rank_attn_proj if args.svd_use_attn_proj else 0,
+        lrp_scale=args.lrp_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
+        if isinstance(module, (CastedLinear, LowRankPersonalizedLinear)):
+            module.to(dtype=torch.float32)
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -940,12 +986,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"svd_training: start_step={args.svd_start_step} every={args.svd_every} mix={args.svd_mix:.3f} "
-        f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
-        f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
-        f"method={args.svd_method} power_iters={args.svd_power_iters} oversample={args.svd_oversample} "
-        f"layer_stride={args.svd_layer_stride} parallel_streams={args.svd_parallel_streams} "
-        f"adaptive_threshold={args.svd_adaptive_threshold:.4f} adaptive_max_mats={args.svd_adaptive_max_mats}"
+        f"low_rank_personalization: rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
+        f"rank_attn_proj={args.svd_rank_attn_proj if args.svd_use_attn_proj else 0} lrp_scale={args.lrp_scale:.3f}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1071,15 +1113,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        apply_svd, adaptive_probe = should_apply_svd_projection(step + 1, base_model, args)
-        if apply_svd:
-            svd_t0 = time.perf_counter()
-            svd_stats = apply_periodic_svd_projection(base_model, args, step + 1)
-            log0(
-                f"svd_projection step:{step + 1} mats:{svd_stats.num_mats} avg_residual:{svd_stats.avg_residual:.4f} "
-                f"adaptive_probe:{adaptive_probe:.4f} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
-                console=False,
-            )
         zero_grad_all()
 
         step += 1
