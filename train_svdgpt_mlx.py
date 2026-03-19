@@ -2,7 +2,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 from __future__ import annotations
 
@@ -61,23 +61,31 @@ class Hyperparameters:
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 10))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 12)) # 9
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+    # SVD-aware training / export.
+    svd_every: int = int(os.environ.get("SVD_EVERY", 8))
+    svd_mix: float = float(os.environ.get("SVD_MIX", 0.25))
+    svd_rank_fc: int = int(os.environ.get("SVD_RANK_FC", 64))
+    svd_rank_proj: int = int(os.environ.get("SVD_RANK_PROJ", 64))
+    svd_rank_attn_proj: int = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
+    svd_export_float_dtype: str = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -134,6 +142,13 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+
+
+SVD_TARGET_SUFFIX_TO_RANK_ATTR = {
+    ".mlp.fc.weight": "svd_rank_fc",
+    ".mlp.proj.weight": "svd_rank_proj",
+    ".attn.proj.weight": "svd_rank_attn_proj",
+}
 
 
 def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list[int]:
@@ -204,6 +219,52 @@ def load_data_shard(path: Path) -> np.ndarray:
         raise ValueError(f"Short read for {path}")
     return tokens.astype(np.int32, copy=False)
 
+
+def is_svd_target_name(name: str) -> bool:
+    return any(name.endswith(suffix) for suffix in SVD_TARGET_SUFFIX_TO_RANK_ATTR)
+
+
+def svd_rank_for_name(name: str, args: Hyperparameters) -> int:
+    for suffix, attr_name in SVD_TARGET_SUFFIX_TO_RANK_ATTR.items():
+        if name.endswith(suffix):
+            return int(getattr(args, attr_name))
+    return 0
+
+
+def export_np_dtype(args: Hyperparameters) -> np.dtype:
+    name = args.svd_export_float_dtype.lower()
+    if name == "float16":
+        return np.float16
+    if name == "float32":
+        return np.float32
+    raise ValueError(f"Unsupported SVD_EXPORT_FLOAT_DTYPE={args.svd_export_float_dtype}")
+
+
+def truncated_svd_np(
+    weight: mx.array,
+    rank: int,
+    mix: float,
+) -> mx.array:
+    arr = np.array(weight.astype(mx.float32), dtype=np.float32, copy=False)
+    out_dim, in_dim = arr.shape
+    max_rank = min(out_dim, in_dim)
+    rank = max(1, min(int(rank), max_rank))
+    if rank >= max_rank:
+        return weight
+    u, s, vh = np.linalg.svd(arr, full_matrices=False)
+    low_rank = (u[:, :rank] * s[:rank]) @ vh[:rank, :]
+    if mix < 1.0:
+        low_rank = (1.0 - mix) * arr + mix * low_rank
+    return mx.array(low_rank, dtype=weight.dtype)
+
+
+def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters) -> None:
+    if args.svd_every <= 0:
+        return
+    for block in model.blocks:
+        block.mlp.fc.weight = truncated_svd_np(block.mlp.fc.weight, args.svd_rank_fc, args.svd_mix)
+        block.mlp.proj.weight = truncated_svd_np(block.mlp.proj.weight, args.svd_rank_proj, args.svd_mix)
+        block.attn.proj.weight = truncated_svd_np(block.attn.proj.weight, args.svd_rank_attn_proj, args.svd_mix)
 
 # ==============================================================================
 # TOKEN STREAMING / BATCHING
@@ -537,12 +598,13 @@ class SplitOptimizers:
         model.update(tree_unflatten(list(updated.items())))
 
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# QUANTIZATION (INT8 + ZLIB) + SVD EXPORT
 # ==============================================================================
 # - per-row int8 for 2D float tensors
 # - per-tensor int8 for other float tensors
 # - fp16 passthrough for small float tensors
 # - exact passthrough for non-floats
+# - selected MLP matrices can be stored as truncated SVD factors instead of dense tensors
 
 MX_DTYPE_FROM_NAME = {
     "float32": mx.float32,
@@ -588,21 +650,98 @@ def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def svd_factorize_array(arr: mx.array, rank: int, store_dtype: np.dtype) -> dict[str, np.ndarray | str | tuple[int, ...] | int]:
+    f32 = _np_float32(arr)
+    out_dim, in_dim = f32.shape
+    max_rank = min(out_dim, in_dim)
+    rank = max(1, min(int(rank), max_rank))
+
+    u, s, vh = np.linalg.svd(f32, full_matrices=False)
+
+    u = np.ascontiguousarray(u[:, :rank].astype(np.float32, copy=False))
+    s = np.ascontiguousarray(s[:rank].astype(store_dtype, copy=False))
+    vh = np.ascontiguousarray(vh[:rank, :].astype(np.float32, copy=False))
+
+    # Quantize U and Vh like the rest of the script does for 2D float tensors.
+    u_q, u_scale = quantize_float_array(mx.array(u))
+    vh_q, vh_scale = quantize_float_array(mx.array(vh))
+
+    return {
+        "shape": f32.shape,
+        "rank": rank,
+        "u_q": u_q,
+        "u_scale": u_scale,
+        "vh_q": vh_q,
+        "vh_scale": vh_scale,
+        "s": s,
+        "dtype": str(arr.dtype).split(".")[-1],
+    }
+
+
+def reconstruct_svd_factorized_array(spec: dict[str, object]) -> mx.array:
+    dtype_name = str(spec["dtype"])
+
+    u_q = np.asarray(spec["u_q"], dtype=np.int8)
+    u_scale = np.asarray(spec["u_scale"], dtype=np.float32)
+    if u_scale.ndim > 0:
+        u = u_q.astype(np.float32) * u_scale.reshape((u_q.shape[0],) + (1,) * (u_q.ndim - 1))
+    else:
+        u = u_q.astype(np.float32) * float(u_scale)
+
+    vh_q = np.asarray(spec["vh_q"], dtype=np.int8)
+    vh_scale = np.asarray(spec["vh_scale"], dtype=np.float32)
+    if vh_scale.ndim > 0:
+        vh = vh_q.astype(np.float32) * vh_scale.reshape((vh_q.shape[0],) + (1,) * (vh_q.ndim - 1))
+    else:
+        vh = vh_q.astype(np.float32) * float(vh_scale)
+
+    s = np.asarray(spec["s"], dtype=np.float32)
+
+    arr = (u * s[None, :]) @ vh
+    return mx.array(arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
+
+def quantize_state_dict_int8(flat_state: dict[str, mx.array], args: Hyperparameters) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, np.ndarray] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
+    svd_factors: dict[str, dict[str, object]] = {}
+    store_dtype = export_np_dtype(args)
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "int8_payload_bytes",
+            "svd_factor_bytes",
+        ),
         0,
     )
     for name, arr in flat_state.items():
         stats["param_count"] += int(arr.size)
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += int(arr.nbytes)
+
+        if is_svd_target_name(name):
+            stats["num_float_tensors"] += 1
+            rank = svd_rank_for_name(name, args)
+            spec = svd_factorize_array(arr, rank, store_dtype)
+            svd_factors[name] = spec
+            svd_bytes = (
+                spec["u_q"].nbytes
+                + spec["u_scale"].nbytes
+                + spec["vh_q"].nbytes
+                + spec["vh_scale"].nbytes
+                + spec["s"].nbytes
+            )
+            stats["svd_factor_bytes"] += int(svd_bytes)
+            stats["int8_payload_bytes"] += int(svd_bytes)
+            continue
+
         if not mx.issubdtype(arr.dtype, mx.floating):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = np.ascontiguousarray(np.array(arr))
@@ -626,11 +765,12 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         dtypes[name] = str(arr.dtype).split(".")[-1]
         stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int8_plus_svd_v2",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
         "passthrough": passthrough,
+        "svd_factors": svd_factors,
     }
     if qmeta:
         obj["qmeta"] = qmeta
@@ -653,6 +793,8 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
+    for name, spec in quant_obj.get("svd_factors", {}).items():
+        out[name] = reconstruct_svd_factorized_array(spec)
     for name, arr in quant_obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_arr = np.array(arr, copy=True)
@@ -731,7 +873,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
     usable = ((tokens.size - 1) // seq_len) * seq_len
-
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
@@ -762,7 +903,6 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
-    log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -776,11 +916,10 @@ def eval_val(
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
-    total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
-    total_loss_sum = 0.0
+    total_loss = mx.array(0.0, dtype=mx.float32)
     total_tokens = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+    for batch_seq_start in range(0, total_seqs, val_batch_seqs):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -790,9 +929,7 @@ def eval_val(
         x = mx.array(x_np, dtype=mx.int32)
         y = mx.array(y_np, dtype=mx.int32)
         chunk_token_count = float(y.size)
-        batch_loss = compiled_loss(x, y).astype(mx.float32)
-        mx.eval(batch_loss)
-        total_loss_sum += float(batch_loss.item()) * chunk_token_count
+        total_loss = total_loss + compiled_loss(x, y).astype(mx.float32) * chunk_token_count
         prev_ids = x_np.reshape(-1)
         tgt_ids = y_np.reshape(-1)
         bytes_np = base_bytes_lut[tgt_ids].astype(np.int16, copy=True)
@@ -801,11 +938,9 @@ def eval_val(
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
-        if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
-        ):
-            log_fn(f"val_progress:{batch_idx}/{total_batches}")
-    val_loss = total_loss_sum / total_tokens
+    total_loss = total_loss / total_tokens
+    mx.eval(total_loss)
+    val_loss = float(total_loss.item())
     bits_per_token = val_loss / math.log(2.0)
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
@@ -937,6 +1072,10 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    flat_params = dict(tree_flatten(model.parameters()))
+    for name, p in flat_params.items():
+        if is_svd_target_name(name):
+            log(f"svd_target:{name} shape:{tuple(p.shape)}")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -949,6 +1088,11 @@ def main() -> None:
         f"embed_lr:{args.tied_embed_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
+    )
+    log(
+        f"svd_training: every={args.svd_every} mix={args.svd_mix:.3f} "
+        f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
+        f"rank_attn_proj={args.svd_rank_attn_proj} export_dtype={args.svd_export_float_dtype}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
@@ -1004,7 +1148,6 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
@@ -1013,8 +1156,8 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
-                log_fn=log,
             )
+            train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1041,6 +1184,10 @@ def main() -> None:
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
+        if args.svd_every > 0 and (step + 1) % args.svd_every == 0:
+            svd_t0 = time.perf_counter()
+            apply_periodic_svd_projection(model, args)
+            log(f"svd_projection step:{step + 1} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}", console=False)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
@@ -1056,28 +1203,27 @@ def main() -> None:
             stop_after_step = step
 
     # ==============================================================================
-    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
+    # FINAL SERIALIZATION + QUANTIZED/SVD ROUNDTRIP EVAL
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
+    # We write a raw dense artifact for inspection and an int8+SVD artifact for fair comparison.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_obj, quant_stats = quantize_state_dict_int8(flat_state, args)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+    quant_path = out_dir / f"{args.run_id}_mlx_model.int8_svd.ptz"
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
     ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
     log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        f"serialized_model_int8_svd_zlib:{quant_file_bytes} bytes "
+        f"(payload:{quant_stats['int8_payload_bytes']} svd_factor_bytes:{quant_stats['svd_factor_bytes']} "
+        f"raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
 
     with quant_path.open("rb") as f:
@@ -1092,11 +1238,10 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
-        log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(f"final_int8_svd_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+    log(f"final_int8_svd_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
