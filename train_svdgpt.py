@@ -978,7 +978,7 @@ def main() -> None:
         if args.svd_every > 0 and (step + 1) % args.svd_every == 0:
             svd_t0 = time.perf_counter()
             apply_periodic_svd_projection(base_model, args)
-            log0(f"svd_projection step:{step + 1} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}")
+            log0(f"svd_projection step:{step + 1} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}", console=False)
         zero_grad_all()
 
         step += 1
