@@ -26,6 +26,14 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
+from svdgpt_artifact import (
+    dequantize_state_dict_int8 as dequantize_state_dict_int8_np,
+    export_np_dtype,
+    is_svd_target_name,
+    quantize_state_dict_int8 as quantize_state_dict_int8_np,
+    svd_rank_for_name,
+)
+
 # ==============================================================================
 # SHARD FORMAT + COMPUTE DTYPE
 # ==============================================================================
@@ -144,13 +152,6 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 )
 
 
-SVD_TARGET_SUFFIX_TO_RANK_ATTR = {
-    ".mlp.fc.weight": "svd_rank_fc",
-    ".mlp.proj.weight": "svd_rank_proj",
-    ".attn.proj.weight": "svd_rank_attn_proj",
-}
-
-
 def token_chunks(total_tokens: int, seq_len: int, max_chunk_tokens: int) -> list[int]:
     usable_total = (total_tokens // seq_len) * seq_len
     if usable_total <= 0:
@@ -218,26 +219,6 @@ def load_data_shard(path: Path) -> np.ndarray:
     if tokens.size != num_tokens:
         raise ValueError(f"Short read for {path}")
     return tokens.astype(np.int32, copy=False)
-
-
-def is_svd_target_name(name: str) -> bool:
-    return any(name.endswith(suffix) for suffix in SVD_TARGET_SUFFIX_TO_RANK_ATTR)
-
-
-def svd_rank_for_name(name: str, args: Hyperparameters) -> int:
-    for suffix, attr_name in SVD_TARGET_SUFFIX_TO_RANK_ATTR.items():
-        if name.endswith(suffix):
-            return int(getattr(args, attr_name))
-    return 0
-
-
-def export_np_dtype(args: Hyperparameters) -> np.dtype:
-    name = args.svd_export_float_dtype.lower()
-    if name == "float16":
-        return np.float16
-    if name == "float32":
-        return np.float32
-    raise ValueError(f"Unsupported SVD_EXPORT_FLOAT_DTYPE={args.svd_export_float_dtype}")
 
 
 def truncated_svd_np(
@@ -612,197 +593,28 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
-INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
-
-def _np_float32(arr: mx.array) -> np.ndarray:
-    return np.array(arr.astype(mx.float32), dtype=np.float32, copy=False)
-
-
-def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str, str]) -> np.ndarray:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return np.ascontiguousarray(_np_float32(arr))
-    if arr.dtype in {mx.float32, mx.bfloat16}:
-        passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
-        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
-    return np.ascontiguousarray(np.array(arr, copy=True))
-
-
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
-    f32 = _np_float32(arr)
-    if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
-        clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
-        scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
-
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
-    scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
-    return np.ascontiguousarray(q), scale
-
-
-def svd_factorize_array(arr: mx.array, rank: int, store_dtype: np.dtype) -> dict[str, np.ndarray | str | tuple[int, ...] | int]:
-    f32 = _np_float32(arr)
-    out_dim, in_dim = f32.shape
-    max_rank = min(out_dim, in_dim)
-    rank = max(1, min(int(rank), max_rank))
-
-    u, s, vh = np.linalg.svd(f32, full_matrices=False)
-
-    u = np.ascontiguousarray(u[:, :rank].astype(np.float32, copy=False))
-    s = np.ascontiguousarray(s[:rank].astype(store_dtype, copy=False))
-    vh = np.ascontiguousarray(vh[:rank, :].astype(np.float32, copy=False))
-
-    # Quantize U and Vh like the rest of the script does for 2D float tensors.
-    u_q, u_scale = quantize_float_array(mx.array(u))
-    vh_q, vh_scale = quantize_float_array(mx.array(vh))
-
-    return {
-        "shape": f32.shape,
-        "rank": rank,
-        "u_q": u_q,
-        "u_scale": u_scale,
-        "vh_q": vh_q,
-        "vh_scale": vh_scale,
-        "s": s,
-        "dtype": str(arr.dtype).split(".")[-1],
-    }
-
-
-def reconstruct_svd_factorized_array(spec: dict[str, object]) -> mx.array:
-    dtype_name = str(spec["dtype"])
-
-    u_q = np.asarray(spec["u_q"], dtype=np.int8)
-    u_scale = np.asarray(spec["u_scale"], dtype=np.float32)
-    if u_scale.ndim > 0:
-        u = u_q.astype(np.float32) * u_scale.reshape((u_q.shape[0],) + (1,) * (u_q.ndim - 1))
-    else:
-        u = u_q.astype(np.float32) * float(u_scale)
-
-    vh_q = np.asarray(spec["vh_q"], dtype=np.int8)
-    vh_scale = np.asarray(spec["vh_scale"], dtype=np.float32)
-    if vh_scale.ndim > 0:
-        vh = vh_q.astype(np.float32) * vh_scale.reshape((vh_q.shape[0],) + (1,) * (vh_q.ndim - 1))
-    else:
-        vh = vh_q.astype(np.float32) * float(vh_scale)
-
-    s = np.asarray(spec["s"], dtype=np.float32)
-
-    arr = (u * s[None, :]) @ vh
-    return mx.array(arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
-
 def quantize_state_dict_int8(flat_state: dict[str, mx.array], args: Hyperparameters) -> tuple[dict[str, object], dict[str, int]]:
-    quantized: dict[str, np.ndarray] = {}
-    scales: dict[str, np.ndarray] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, np.ndarray] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    svd_factors: dict[str, dict[str, object]] = {}
-    store_dtype = export_np_dtype(args)
-    stats = dict.fromkeys(
-        (
-            "param_count",
-            "num_tensors",
-            "num_float_tensors",
-            "num_nonfloat_tensors",
-            "baseline_tensor_bytes",
-            "int8_payload_bytes",
-            "svd_factor_bytes",
-        ),
-        0,
-    )
-    for name, arr in flat_state.items():
-        stats["param_count"] += int(arr.size)
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += int(arr.nbytes)
-
-        if is_svd_target_name(name):
-            stats["num_float_tensors"] += 1
-            rank = svd_rank_for_name(name, args)
-            spec = svd_factorize_array(arr, rank, store_dtype)
-            svd_factors[name] = spec
-            svd_bytes = (
-                spec["u_q"].nbytes
-                + spec["u_scale"].nbytes
-                + spec["vh_q"].nbytes
-                + spec["vh_scale"].nbytes
-                + spec["s"].nbytes
-            )
-            stats["svd_factor_bytes"] += int(svd_bytes)
-            stats["int8_payload_bytes"] += int(svd_bytes)
-            continue
-
-        if not mx.issubdtype(arr.dtype, mx.floating):
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = np.ascontiguousarray(np.array(arr))
-            stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
-            continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_array(name, arr, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int8_payload_bytes"] += int(kept.nbytes)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(arr.dtype).split(".")[-1]
-        stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
-    obj: dict[str, object] = {
-        "__quant_format__": "int8_plus_svd_v2",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-        "svd_factors": svd_factors,
+    np_state = {
+        name: np.ascontiguousarray(np.array(arr))
+        for name, arr in flat_state.items()
     }
-    if qmeta:
-        obj["qmeta"] = qmeta
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
+    return quantize_state_dict_int8_np(
+        np_state,
+        keep_float_fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
+        svd_rank_lookup=lambda name: svd_rank_for_name(name, args),
+        svd_export_dtype=export_np_dtype(args.svd_export_float_dtype),
+    )
 
 
 def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.array]:
+    np_state = dequantize_state_dict_int8_np(quant_obj)
     out: dict[str, mx.array] = {}
-    qmeta = quant_obj.get("qmeta", {})
-    passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
-    for name, q in quant_obj["quantized"].items():
-        q_np = np.asarray(q, dtype=np.int8)
-        dtype_name = quant_obj["dtypes"][name]
-        scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
-        if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
-            out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+    for name, arr in np_state.items():
+        dtype_name = str(arr.dtype)
+        if dtype_name in MX_DTYPE_FROM_NAME:
+            out[name] = mx.array(arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
         else:
-            out_arr = q_np.astype(np.float32) * float(scale)
-        out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
-    for name, spec in quant_obj.get("svd_factors", {}).items():
-        out[name] = reconstruct_svd_factorized_array(spec)
-    for name, arr in quant_obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
-        out_arr = np.array(arr, copy=True)
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[orig_dtype])
-        else:
-            out[name] = mx.array(out_arr)
+            out[name] = mx.array(arr)
     return out
 
 
