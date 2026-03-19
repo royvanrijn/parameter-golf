@@ -93,10 +93,12 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     svd_every = int(os.environ.get("SVD_EVERY", 0))
+    svd_start_step = int(os.environ.get("SVD_START_STEP", 0))
     svd_mix = float(os.environ.get("SVD_MIX", 0.25))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
+    svd_use_attn_proj = bool(int(os.environ.get("SVD_USE_ATTN_PROJ", "1")))
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
 
 # -----------------------------
@@ -143,9 +145,17 @@ def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters) -> No
     for block in model.blocks:
         block.mlp.fc.weight.copy_(truncated_svd_weight(block.mlp.fc.weight, args.svd_rank_fc, args.svd_mix))
         block.mlp.proj.weight.copy_(truncated_svd_weight(block.mlp.proj.weight, args.svd_rank_proj, args.svd_mix))
-        block.attn.proj.weight.copy_(
-            truncated_svd_weight(block.attn.proj.weight, args.svd_rank_attn_proj, args.svd_mix)
-        )
+        if args.svd_use_attn_proj:
+            block.attn.proj.weight.copy_(
+                truncated_svd_weight(block.attn.proj.weight, args.svd_rank_attn_proj, args.svd_mix)
+            )
+
+
+def should_apply_svd_projection(step_1idx: int, args: Hyperparameters) -> bool:
+    if args.svd_every <= 0:
+        return False
+    start_step = max(int(args.svd_start_step), 0)
+    return step_1idx >= start_step and (step_1idx - start_step) % args.svd_every == 0
 
 
 class Muon(torch.optim.Optimizer):
@@ -851,9 +861,9 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"svd_training: every={args.svd_every} mix={args.svd_mix:.3f} "
+        f"svd_training: start_step={args.svd_start_step} every={args.svd_every} mix={args.svd_mix:.3f} "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
-        f"rank_attn_proj={args.svd_rank_attn_proj}"
+        f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj}"
     )
     log0(f"seed:{args.seed}")
 
@@ -979,7 +989,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        if args.svd_every > 0 and (step + 1) % args.svd_every == 0:
+        if should_apply_svd_projection(step + 1, args):
             svd_t0 = time.perf_counter()
             apply_periodic_svd_projection(base_model, args)
             log0(f"svd_projection step:{step + 1} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}", console=False)

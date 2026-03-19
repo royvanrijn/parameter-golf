@@ -23,6 +23,8 @@ def is_svd_target_name(name: str) -> bool:
 def svd_rank_for_name(name: str, args: object) -> int:
     for suffix, attr_name in SVD_TARGET_SUFFIX_TO_RANK_ATTR.items():
         if name.endswith(suffix):
+            if suffix == ".attn.proj.weight" and not bool(getattr(args, "svd_use_attn_proj", True)):
+                return 0
             return int(getattr(args, attr_name))
     return 0
 
