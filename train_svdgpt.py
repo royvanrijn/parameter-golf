@@ -343,7 +343,11 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], args: Hyperparameters):
     np_state = {
-        name: np.ascontiguousarray(t.detach().to("cpu").numpy())
+        name: np.ascontiguousarray(
+            (t.detach().to(dtype=torch.float32) if t.dtype == torch.bfloat16 else t.detach())
+            .to("cpu")
+            .numpy()
+        )
         for name, t in state_dict.items()
     }
     return quantize_state_dict_int8_np(
