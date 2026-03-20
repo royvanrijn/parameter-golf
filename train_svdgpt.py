@@ -96,6 +96,13 @@ class Hyperparameters:
     svd_every = int(os.environ.get("SVD_EVERY", 0))
     svd_start_step = int(os.environ.get("SVD_START_STEP", 0))
     svd_mix = float(os.environ.get("SVD_MIX", 0.25))
+    svd_phase1_start = int(os.environ.get("SVD_PHASE1_START", os.environ.get("SVD_START_STEP", 0)))
+    svd_phase2_start = int(os.environ.get("SVD_PHASE2_START", os.environ.get("SVD_PHASE1_START", os.environ.get("SVD_START_STEP", 0))))
+    svd_phase1_every = int(os.environ.get("SVD_PHASE1_EVERY", os.environ.get("SVD_EVERY", 0)))
+    svd_phase2_every = int(os.environ.get("SVD_PHASE2_EVERY", os.environ.get("SVD_EVERY", 0)))
+    svd_phase1_mix_start = float(os.environ.get("SVD_PHASE1_MIX_START", 0.1))
+    svd_phase1_mix_end = float(os.environ.get("SVD_PHASE1_MIX_END", 0.75))
+    svd_phase2_mix = float(os.environ.get("SVD_PHASE2_MIX", os.environ.get("SVD_PHASE1_MIX_END", 0.75)))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
@@ -160,7 +167,15 @@ def truncated_svd_weight(weight: Tensor, rank: int, mix: float, args: Hyperparam
 @torch.no_grad()
 def collect_svd_targets(model: nn.Module, args: Hyperparameters, step_1idx: int) -> list[tuple[Tensor, int]]:
     layer_stride = max(1, int(args.svd_layer_stride))
-    period_idx = max(step_1idx - max(int(args.svd_start_step), 0), 0) // max(int(args.svd_every), 1)
+    phase1_start = max(int(args.svd_phase1_start), 0)
+    phase2_start = max(int(args.svd_phase2_start), phase1_start)
+    if step_1idx < phase2_start:
+        anchor_step = phase1_start
+        period = max(int(args.svd_phase1_every), 1)
+    else:
+        anchor_step = phase2_start
+        period = max(int(args.svd_phase2_every), 1)
+    period_idx = max(step_1idx - anchor_step, 0) // period
     layer_offset = period_idx % layer_stride
     targets: list[tuple[Tensor, int]] = []
     for layer_idx, block in enumerate(model.blocks):
@@ -180,8 +195,8 @@ class SVDProjectionStats:
 
 
 @torch.no_grad()
-def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters, step_1idx: int) -> SVDProjectionStats:
-    if args.svd_every <= 0:
+def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters, step_1idx: int, mix: float) -> SVDProjectionStats:
+    if args.svd_phase1_every <= 0 and args.svd_phase2_every <= 0:
         return SVDProjectionStats(num_mats=0, avg_residual=0.0)
     targets = collect_svd_targets(model, args, step_1idx)
     if not targets:
@@ -196,12 +211,12 @@ def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters, step_
     if streams:
         for idx, (weight, rank) in enumerate(targets):
             with torch.cuda.stream(streams[idx % stream_count]):
-                outputs[idx] = truncated_svd_weight(weight, rank, args.svd_mix, args)
+                outputs[idx] = truncated_svd_weight(weight, rank, mix, args)
         for stream in streams:
             stream.synchronize()
     else:
         for idx, (weight, rank) in enumerate(targets):
-            outputs[idx] = truncated_svd_weight(weight, rank, args.svd_mix, args)
+            outputs[idx] = truncated_svd_weight(weight, rank, mix, args)
 
     residual_sum = 0.0
     for (weight, _), packed in zip(targets, outputs):
@@ -213,28 +228,61 @@ def apply_periodic_svd_projection(model: nn.Module, args: Hyperparameters, step_
 
 
 @torch.no_grad()
-def should_apply_svd_projection(step_1idx: int, model: nn.Module, args: Hyperparameters) -> tuple[bool, float]:
-    if args.svd_every <= 0:
-        return False, 0.0
-    start_step = max(int(args.svd_start_step), 0)
-    due = step_1idx >= start_step and (step_1idx - start_step) % args.svd_every == 0
+def svd_projection_schedule(step_1idx: int, args: Hyperparameters) -> tuple[bool, float, int]:
+    def clamp_mix(value: float) -> float:
+        return max(0.0, min(float(value), 1.0))
+
+    phase1_start = max(int(args.svd_phase1_start), 0)
+    phase2_start = max(int(args.svd_phase2_start), phase1_start)
+    phase1_every = max(int(args.svd_phase1_every), 0)
+    phase2_every = max(int(args.svd_phase2_every), 0)
+
+    if step_1idx < phase1_start:
+        return False, 0.0, 0
+
+    if step_1idx < phase2_start:
+        if phase1_every <= 0:
+            return False, 0.0, 1
+        due = (step_1idx - phase1_start) % phase1_every == 0
+        if not due:
+            return False, 0.0, 1
+        if phase2_start == phase1_start:
+            progress = 1.0
+        else:
+            progress = (step_1idx - phase1_start) / max(phase2_start - phase1_start, 1)
+        mix = float(args.svd_phase1_mix_start) + max(0.0, min(progress, 1.0)) * (
+            float(args.svd_phase1_mix_end) - float(args.svd_phase1_mix_start)
+        )
+        return True, clamp_mix(mix), 1
+
+    if phase2_every <= 0:
+        return False, 0.0, 2
+    due = (step_1idx - phase2_start) % phase2_every == 0
     if not due:
-        return False, 0.0
+        return False, 0.0, 2
+    return True, clamp_mix(args.svd_phase2_mix), 2
+
+
+@torch.no_grad()
+def should_apply_svd_projection(step_1idx: int, model: nn.Module, args: Hyperparameters) -> tuple[bool, float, float, int]:
+    due, mix, phase = svd_projection_schedule(step_1idx, args)
+    if not due:
+        return False, 0.0, 0.0, phase
     threshold = float(args.svd_adaptive_threshold)
     if threshold <= 0:
-        return True, 0.0
+        return True, mix, 0.0, phase
     sample_targets = collect_svd_targets(model, args, step_1idx)
     max_mats = max(1, int(args.svd_adaptive_max_mats))
     if len(sample_targets) > max_mats:
         sample_targets = sample_targets[:max_mats]
     if not sample_targets:
-        return False, 0.0
+        return False, 0.0, 0.0, phase
     residual_sum = 0.0
     for weight, rank in sample_targets:
         _, residual = truncated_svd_weight(weight, rank, 1.0, args)
         residual_sum += residual
     avg_residual = residual_sum / len(sample_targets)
-    return avg_residual >= threshold, avg_residual
+    return avg_residual >= threshold, mix, avg_residual, phase
 
 
 class Muon(torch.optim.Optimizer):
@@ -940,7 +988,10 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"svd_training: start_step={args.svd_start_step} every={args.svd_every} mix={args.svd_mix:.3f} "
+        f"svd_training: phase1_start={args.svd_phase1_start} phase2_start={args.svd_phase2_start} "
+        f"phase1_every={args.svd_phase1_every} phase2_every={args.svd_phase2_every} "
+        f"phase1_mix_start={args.svd_phase1_mix_start:.3f} phase1_mix_end={args.svd_phase1_mix_end:.3f} "
+        f"phase2_mix={args.svd_phase2_mix:.3f} (legacy_start={args.svd_start_step} legacy_every={args.svd_every} legacy_mix={args.svd_mix:.3f}) "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
         f"method={args.svd_method} power_iters={args.svd_power_iters} oversample={args.svd_oversample} "
@@ -1071,13 +1122,14 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        apply_svd, adaptive_probe = should_apply_svd_projection(step + 1, base_model, args)
+        apply_svd, svd_mix, adaptive_probe, svd_phase = should_apply_svd_projection(step + 1, base_model, args)
         if apply_svd:
             svd_t0 = time.perf_counter()
-            svd_stats = apply_periodic_svd_projection(base_model, args, step + 1)
+            svd_stats = apply_periodic_svd_projection(base_model, args, step + 1, svd_mix)
             log0(
                 f"svd_projection step:{step + 1} mats:{svd_stats.num_mats} avg_residual:{svd_stats.avg_residual:.4f} "
-                f"adaptive_probe:{adaptive_probe:.4f} took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
+                f"phase:{svd_phase} mix:{svd_mix:.3f} adaptive_probe:{adaptive_probe:.4f} "
+                f"took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
                 console=False,
             )
         zero_grad_all()
