@@ -247,12 +247,6 @@ def eval_val(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    eval_model = model.module if isinstance(model, DDP) else model
-    # Sliding-window evaluation uses variable sequence lengths near the beginning/end
-    # of each rank's shard. Route eval through the eager module to avoid excessive
-    # torch.compile recompiles from shape changes during validation.
-    if hasattr(eval_model, "_orig_mod"):
-        eval_model = eval_model._orig_mod
 
     model.eval()
     with torch.inference_mode():
@@ -265,7 +259,7 @@ def eval_val(
             y = local[1:].unsqueeze(0)
             loss_start_idx = x.size(1) - score_tokens
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = eval_model(x, y, loss_start_idx).detach()
+                batch_loss = model(x, y, loss_start_idx).detach()
             batch_token_count = float(score_tokens)
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
