@@ -997,11 +997,15 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+
     restore_low_dim_params_to_fp32(base_model)
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
         block_named_params = list(base_model.blocks.named_parameters())
@@ -1156,6 +1160,8 @@ def main() -> None:
     step = 0
     if transition_step == 0 and not transitioned:
         converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
         optimizers, optimizer_muon = build_optimizers()
         transitioned = True
         log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
@@ -1215,6 +1221,10 @@ def main() -> None:
         if (not transitioned) and step_1idx >= transition_step:
             trans_t0 = time.perf_counter()
             converted, avg_residual = transition_to_factorized(base_model, args, step_1idx)
+
+            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+            model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
             optimizers, optimizer_muon = build_optimizers()
             zero_grad_all()
             transitioned = True
