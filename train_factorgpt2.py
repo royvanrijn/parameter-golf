@@ -645,10 +645,7 @@ class GPT(nn.Module):
         self.step_attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
         self.step_mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
         self.step_resid_mixes = nn.Parameter(
-            torch.stack(
-                (torch.ones(num_layers, model_dim), torch.zeros(num_layers, model_dim)),
-                dim=1,
-            ).float()
+            torch.stack((torch.ones(num_layers, model_dim), torch.zeros(num_layers, model_dim))).float()
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
