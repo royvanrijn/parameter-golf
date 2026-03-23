@@ -58,6 +58,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    progressive_ramp_steps = int(os.environ.get("PROGRESSIVE_RAMP_STEPS", 300))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -69,6 +70,10 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    stage1_active_layers = int(os.environ.get("STAGE1_ACTIVE_LAYERS", num_layers))
+    stage2_active_layers = int(os.environ.get("STAGE2_ACTIVE_LAYERS", num_layers))
+    stage1_end_step = int(os.environ.get("STAGE1_END_STEP", 0))
+    stage2_end_step = int(os.environ.get("STAGE2_END_STEP", 0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -247,7 +252,11 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    # NOTE: Use no_grad instead of inference_mode here. With torch.compile + staged
+    # progressive depth, validation can trigger a new compiled path right before
+    # training resumes, and inference tensors from inference_mode may then be seen
+    # by autograd on the next training step.
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -659,6 +668,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        stage1_active_layers: int,
+        stage2_active_layers: int,
+        stage1_end_step: int,
+        stage2_end_step: int,
+        progressive_ramp_steps: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -670,6 +684,36 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        if not (0 < stage1_active_layers <= num_layers):
+            raise ValueError(
+                f"STAGE1_ACTIVE_LAYERS must be in [1, {num_layers}], got {stage1_active_layers}"
+            )
+        if not (stage1_active_layers <= stage2_active_layers <= num_layers):
+            raise ValueError(
+                "STAGE2_ACTIVE_LAYERS must satisfy "
+                f"STAGE1_ACTIVE_LAYERS <= STAGE2_ACTIVE_LAYERS <= NUM_LAYERS, got "
+                f"{stage1_active_layers}, {stage2_active_layers}, {num_layers}"
+            )
+        if stage1_end_step < 0 or stage2_end_step < 0:
+            raise ValueError(
+                f"stage end steps must be non-negative, got {stage1_end_step}, {stage2_end_step}"
+            )
+        if stage1_end_step > stage2_end_step:
+            raise ValueError(
+                f"STAGE1_END_STEP must be <= STAGE2_END_STEP, got {stage1_end_step} > {stage2_end_step}"
+            )
+        self.stage1_active_layers = stage1_active_layers
+        self.stage2_active_layers = stage2_active_layers
+        self.stage1_end_step = stage1_end_step
+        self.stage2_end_step = stage2_end_step
+        self.progressive_ramp_steps = progressive_ramp_steps
+        self.activation_steps = [0 for _ in range(num_layers)]
+        for i in range(stage1_active_layers, stage2_active_layers):
+            self.activation_steps[i] = stage1_end_step
+        for i in range(stage2_active_layers, num_layers):
+            self.activation_steps[i] = stage2_end_step
+        self._active_layers_runtime = -1
+        self._current_step = 0
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
@@ -689,6 +733,7 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+        self.set_progressive_depth(0)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -696,6 +741,32 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _active_layers_for_step(self, step: int) -> int:
+        if step < self.stage1_end_step:
+            return self.stage1_active_layers
+        if step < self.stage2_end_step:
+            return self.stage2_active_layers
+        return len(self.blocks)
+
+    def set_progressive_depth(self, step: int) -> None:
+        self._current_step = step
+        active_layers = self._active_layers_for_step(step)
+        if active_layers != self._active_layers_runtime:
+            for i, block in enumerate(self.blocks):
+                block_enabled = i < active_layers
+                for p in block.parameters():
+                    p.requires_grad_(block_enabled)
+            self._active_layers_runtime = active_layers
+
+    def _layer_gate(self, layer_idx: int) -> float:
+        if layer_idx < self.stage1_active_layers:
+            return 1.0
+        if self.progressive_ramp_steps <= 0:
+            return 1.0
+        activation_step = self.activation_steps[layer_idx]
+        progress = (self._current_step - activation_step) / self.progressive_ramp_steps
+        return float(min(max(progress, 0.0), 1.0))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -705,12 +776,21 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            if i >= self._active_layers_runtime:
+                break
+            y = self.blocks[i](x, x0)
+            gate = self._layer_gate(i)
+            x = x + gate * (y - x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            block_idx = self.num_encoder_layers + i
+            if block_idx >= self._active_layers_runtime:
+                break
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            y = self.blocks[block_idx](x, x0)
+            gate = self._layer_gate(block_idx)
+            x = x + gate * (y - x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +915,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        stage1_active_layers=args.stage1_active_layers,
+        stage2_active_layers=args.stage2_active_layers,
+        stage1_end_step=args.stage1_end_step,
+        stage2_end_step=args.stage2_end_step,
+        progressive_ramp_steps=args.progressive_ramp_steps,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +993,12 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        "progressive_depth:"
+        f" stage1_active_layers={args.stage1_active_layers} stage1_end_step={args.stage1_end_step}"
+        f" stage2_active_layers={args.stage2_active_layers} stage2_end_step={args.stage2_end_step}"
+        f" total_layers={args.num_layers} ramp_steps={args.progressive_ramp_steps}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -939,6 +1030,7 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            base_model.set_progressive_depth(0)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -975,6 +1067,7 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
+            base_model.set_progressive_depth(step)
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -1006,6 +1099,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        base_model.set_progressive_depth(step)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1097,6 +1191,7 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.set_progressive_depth(args.iterations)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
