@@ -100,6 +100,8 @@ class Hyperparameters:
     # Defaults to legacy SVD_PHASE2_START for backwards compatibility with the svd2-style launch command.
     svd_transition_step = int(os.environ.get("SVD_TRANSITION_STEP", os.environ.get("SVD_PHASE2_START", 4000)))
     svd_transition_from_step0 = bool(int(os.environ.get("SVD_TRANSITION_FROM_STEP0", "0")))
+    # If enabled, start directly with factorized layers and train only in SVD space.
+    svd_only_from_start = bool(int(os.environ.get("SVD_ONLY_FROM_START", "0")))
     svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
@@ -997,15 +999,11 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-
     restore_low_dim_params_to_fp32(base_model)
-
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
         block_named_params = list(base_model.blocks.named_parameters())
@@ -1074,6 +1072,7 @@ def main() -> None:
     log0(
         f"svd3_training: phase1_start={args.svd_phase1_start} transition_step={args.svd_transition_step} "
         f"transition_from_step0={args.svd_transition_from_step0} "
+        f"svd_only_from_start={args.svd_only_from_start} "
         f"phase1_every={args.svd_phase1_every} "
         f"phase1_mix_start={args.svd_phase1_mix_start:.3f} phase1_mix_end={args.svd_phase1_mix_end:.3f} "
         f"balance_factors={args.svd_balance_factors} "
@@ -1091,8 +1090,8 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    svd_aux = SVD3AuxManager(base_model, args)
-    transition_step = 0 if args.svd_transition_from_step0 else max(int(args.svd_transition_step), 1)
+    svd_aux = None if args.svd_only_from_start else SVD3AuxManager(base_model, args)
+    transition_step = 0 if (args.svd_only_from_start or args.svd_transition_from_step0) else max(int(args.svd_transition_step), 1)
     transitioned = False
 
     def zero_grad_all() -> None:
@@ -1160,8 +1159,6 @@ def main() -> None:
     step = 0
     if transition_step == 0 and not transitioned:
         converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
         optimizers, optimizer_muon = build_optimizers()
         transitioned = True
         log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
@@ -1203,12 +1200,10 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         step_1idx = step + 1
-        svd_mix = svd3_phase1_mix(step_1idx, args, transition_step=transition_step)
-
-        refresh_due = (not transitioned) and svd3_is_phase1_refresh_step(step_1idx, args)
-        aux_active = refresh_due
-
-        if refresh_due:
+        svd_mix = 0.0 if args.svd_only_from_start else svd3_phase1_mix(step_1idx, args, transition_step=transition_step)
+        refresh_due = (not transitioned) and (not args.svd_only_from_start) and svd3_is_phase1_refresh_step(step_1idx, args)
+        aux_active = refresh_due and svd_aux is not None
+        if refresh_due and svd_aux is not None:
             svd_t0 = time.perf_counter()
             stats = svd_aux.refresh_targets(step_1idx)
             log0(
@@ -1221,37 +1216,39 @@ def main() -> None:
         if (not transitioned) and step_1idx >= transition_step:
             trans_t0 = time.perf_counter()
             converted, avg_residual = transition_to_factorized(base_model, args, step_1idx)
-
-            compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-            model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-
             optimizers, optimizer_muon = build_optimizers()
             zero_grad_all()
             transitioned = True
-            svd_aux.begin_step(active=False)
+            if svd_aux is not None:
+                svd_aux.begin_step(active=False)
             log0(
                 f"svd3_transition step:{step_1idx} converted_layers:{converted} "
                 f"avg_residual:{avg_residual:.4f} "
                 f"took_ms:{1000.0 * (time.perf_counter() - trans_t0):.1f}",
             )
 
-        svd_aux.begin_step(active=aux_active and not transitioned)
+        if svd_aux is not None:
+            svd_aux.begin_step(active=aux_active and not transitioned)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            if svd_aux.active:
+            if svd_aux is not None and svd_aux.active:
                 svd_aux.begin_micro_step()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            aux_delta = svd_aux.end_micro_step() if svd_aux.active else torch.zeros_like(loss)
-            total_loss = loss + svd_mix * aux_delta if svd_aux.active else loss
+            aux_delta = svd_aux.end_micro_step() if (svd_aux is not None and svd_aux.active) else torch.zeros_like(loss)
+            total_loss = loss + svd_mix * aux_delta if (svd_aux is not None and svd_aux.active) else loss
             (total_loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        aux_loss_scalar = float((svd_aux.aux_loss_accum / grad_accum_steps).detach().item()) if svd_aux.active else 0.0
+        aux_loss_scalar = (
+            float((svd_aux.aux_loss_accum / grad_accum_steps).detach().item())
+            if (svd_aux is not None and svd_aux.active)
+            else 0.0
+        )
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
