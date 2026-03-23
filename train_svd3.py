@@ -999,15 +999,26 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+
     restore_low_dim_params_to_fp32(base_model)
 
-    # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
-    # distributed reducers/parameter buckets are built from the final trainable params.
+    # always transition to factorized weights at step 0 and train only in SVD space
     converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+    log0(
+        f"svd3_startup_transition converted_layers:{converted} "
+        f"avg_residual:{avg_residual:.4f}"
+    )
+
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+
+    model: nn.Module = (
+        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        if distributed else compiled_model
+    )
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
         block_named_params = list(base_model.blocks.named_parameters())
