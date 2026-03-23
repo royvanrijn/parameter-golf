@@ -97,14 +97,9 @@ class Hyperparameters:
     svd_phase1_every = int(os.environ.get("SVD_PHASE1_EVERY", 50))
     svd_phase1_mix_start = float(os.environ.get("SVD_PHASE1_MIX_START", 0.01))
     svd_phase1_mix_end = float(os.environ.get("SVD_PHASE1_MIX_END", 0.5))
-    svd_phase2_start = int(os.environ.get("SVD_PHASE2_START", 4000))
-    # 0 means transition exactly at phase2_start; otherwise transition at this explicit step.
-    svd_transition_step = int(os.environ.get("SVD_TRANSITION_STEP", 0))
+    # Defaults to legacy SVD_PHASE2_START for backwards compatibility with the svd2-style launch command.
+    svd_transition_step = int(os.environ.get("SVD_TRANSITION_STEP", os.environ.get("SVD_PHASE2_START", 4000)))
     svd_transition_from_step0 = bool(int(os.environ.get("SVD_TRANSITION_FROM_STEP0", "0")))
-    svd_phase2_mix = float(os.environ.get("SVD_PHASE2_MIX", 0.01))
-    svd_phase2_mix_end = float(os.environ.get("SVD_PHASE2_MIX_END", 0.75))
-    svd_phase2_ramp_steps = int(os.environ.get("SVD_PHASE2_RAMP_STEPS", 1500))
-    svd_phase2_every = int(os.environ.get("SVD_PHASE2_EVERY", 5))
     svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
@@ -119,14 +114,10 @@ class Hyperparameters:
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
     svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
-    # Phase 2 fires every 5 steps; niter=0 (single random projection) is 2-3x faster
-    # and accurate enough once weights have already been shaped by phase 1.
+    # Use separate iters for transition SVD (often can be cheaper than phase-1 refresh).
     svd_power_iters_phase2 = int(os.environ.get("SVD_POWER_ITERS_PHASE2", 0))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
     svd_layer_stride = int(os.environ.get("SVD_LAYER_STRIDE", 1))
-    svd_parallel_streams = int(os.environ.get("SVD_PARALLEL_STREAMS", 1))
-    svd_adaptive_threshold = float(os.environ.get("SVD_ADAPTIVE_THRESHOLD", 0.0))
-    svd_adaptive_max_mats = int(os.environ.get("SVD_ADAPTIVE_MAX_MATS", 4))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -744,15 +735,20 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
-def iter_named_svd_linears(model: GPT, args: Hyperparameters, step_1idx: int) -> list[tuple[str, CastedLinear, int]]:
+def iter_named_svd_linears(
+    model: GPT,
+    args: Hyperparameters,
+    step_1idx: int,
+    use_stride: bool = True,
+) -> list[tuple[str, CastedLinear, int]]:
     layer_stride = max(1, int(args.svd_layer_stride))
-    period = max(1, int(args.svd_phase1_every if step_1idx < args.svd_phase2_start else args.svd_phase2_every))
-    anchor = int(args.svd_phase1_start if step_1idx < args.svd_phase2_start else args.svd_phase2_start)
+    period = max(1, int(args.svd_phase1_every))
+    anchor = int(args.svd_phase1_start)
     period_idx = max(step_1idx - anchor, 0) // period
     layer_offset = period_idx % layer_stride
     out: list[tuple[str, CastedLinear, int]] = []
     for layer_idx, block in enumerate(model.blocks):
-        if layer_stride > 1 and layer_idx % layer_stride != layer_offset:
+        if use_stride and layer_stride > 1 and layer_idx % layer_stride != layer_offset:
             continue
         out.append((f"blocks.{layer_idx}.mlp.fc", block.mlp.fc, args.svd_rank_fc))
         out.append((f"blocks.{layer_idx}.mlp.proj", block.mlp.proj, args.svd_rank_proj))
@@ -797,7 +793,8 @@ class SVD3AuxManager:
         self.cached_residual: dict[str, float] = {}
         self.active = False
         self.layer_names: set[str] = set()
-        self.aux_loss = torch.zeros((), device=next(model.parameters()).device)
+        self.aux_loss_accum = torch.zeros((), device=next(model.parameters()).device)
+        self._micro_aux: Tensor | None = None
         self.handles = []
         for name, module in model.named_modules():
             if isinstance(module, CastedLinear):
@@ -818,55 +815,60 @@ class SVD3AuxManager:
             x = inputs[0]
             dense = output
             proj = F.linear(x, wr.to(x.dtype), None)
-            self.aux_loss = self.aux_loss + F.mse_loss(dense, proj, reduction="mean")
+            layer_aux = F.mse_loss(dense, proj, reduction="mean")
+            self._micro_aux = layer_aux if self._micro_aux is None else self._micro_aux + layer_aux
+            self.aux_loss_accum = self.aux_loss_accum + layer_aux.detach()
         return hook
 
     @torch.no_grad()
-    def refresh_targets(self, step_1idx: int, phase: int) -> SVD3AuxStats:
-        selected = iter_named_svd_linears(self.model, self.args, step_1idx)
+    def refresh_targets(self, step_1idx: int) -> SVD3AuxStats:
+        selected = iter_named_svd_linears(self.model, self.args, step_1idx, use_stride=True)
         self.layer_names = {name for name, _, _ in selected}
-        niter_override = self.args.svd_power_iters_phase2 if phase == 2 else None
         residual_sum = 0.0
         for name, module, rank in selected:
-            wr, residual = truncated_svd_weight(module.weight, rank, self.args, niter=niter_override)
+            wr, residual = truncated_svd_weight(module.weight, rank, self.args, niter=self.args.svd_power_iters)
             self.cached_wr[name] = wr.detach()
             self.cached_residual[name] = residual
             residual_sum += residual
         avg_residual = residual_sum / max(len(selected), 1)
-        return SVD3AuxStats(num_layers=len(selected), avg_residual=avg_residual, aux_loss=self.aux_loss.detach())
+        return SVD3AuxStats(num_layers=len(selected), avg_residual=avg_residual, aux_loss=self.aux_loss_accum.detach())
 
     def begin_step(self, active: bool) -> None:
         self.active = active
-        self.aux_loss = torch.zeros((), device=next(self.model.parameters()).device)
+        self.aux_loss_accum = torch.zeros((), device=next(self.model.parameters()).device)
+        self._micro_aux = None
+
+    def begin_micro_step(self) -> None:
+        self._micro_aux = None
+
+    def end_micro_step(self) -> Tensor:
+        if self._micro_aux is None:
+            return torch.zeros((), device=next(self.model.parameters()).device)
+        return self._micro_aux
 
 
-def svd3_phase_and_mix(step_1idx: int, args: Hyperparameters) -> tuple[int, float]:
+def svd3_phase1_mix(step_1idx: int, args: Hyperparameters, transition_step: int) -> float:
     if step_1idx < args.svd_phase1_start:
-        return 0, 0.0
-    if step_1idx < args.svd_phase2_start:
-        denom = max(args.svd_phase2_start - args.svd_phase1_start, 1)
-        progress = min(max((step_1idx - args.svd_phase1_start) / denom, 0.0), 1.0)
-        mix = args.svd_phase1_mix_start + progress * (args.svd_phase1_mix_end - args.svd_phase1_mix_start)
-        return 1, max(0.0, min(float(mix), 1.0))
-    p2_progress = min(max((step_1idx - args.svd_phase2_start) / max(args.svd_phase2_ramp_steps, 1), 0.0), 1.0)
-    mix = args.svd_phase2_mix + p2_progress * (args.svd_phase2_mix_end - args.svd_phase2_mix)
-    return 2, max(0.0, min(float(mix), 1.0))
+        return 0.0
+    denom = max(transition_step - args.svd_phase1_start, 1)
+    progress = min(max((step_1idx - args.svd_phase1_start) / denom, 0.0), 1.0)
+    mix = args.svd_phase1_mix_start + progress * (args.svd_phase1_mix_end - args.svd_phase1_mix_start)
+    return max(0.0, min(float(mix), 1.0))
 
 
-def svd3_is_refresh_step(step_1idx: int, args: Hyperparameters) -> bool:
-    phase, _ = svd3_phase_and_mix(step_1idx, args)
-    if phase == 1:
-        return args.svd_phase1_every > 0 and (step_1idx - args.svd_phase1_start) % args.svd_phase1_every == 0
-    if phase == 2:
-        return args.svd_phase2_every > 0 and (step_1idx - args.svd_phase2_start) % args.svd_phase2_every == 0
-    return False
+def svd3_is_phase1_refresh_step(step_1idx: int, args: Hyperparameters) -> bool:
+    return (
+        step_1idx >= args.svd_phase1_start
+        and args.svd_phase1_every > 0
+        and (step_1idx - args.svd_phase1_start) % args.svd_phase1_every == 0
+    )
 
 
 @torch.no_grad()
 def transition_to_factorized(model: GPT, args: Hyperparameters, step_1idx: int) -> tuple[int, float]:
     converted = 0
     residual_sum = 0.0
-    for name, dense, rank in iter_named_svd_linears(model, args, step_1idx):
+    for name, dense, rank in iter_named_svd_linears(model, args, step_1idx, use_stride=False):
         fact = FactorizedLinear(
             in_features=dense.in_features,
             out_features=dense.out_features,
@@ -1070,12 +1072,11 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"svd3_training: phase1_start={args.svd_phase1_start} phase2_start={args.svd_phase2_start} "
-        f"phase1_every={args.svd_phase1_every} phase2_every={args.svd_phase2_every} "
+        f"svd3_training: phase1_start={args.svd_phase1_start} transition_step={args.svd_transition_step} "
+        f"transition_from_step0={args.svd_transition_from_step0} "
+        f"phase1_every={args.svd_phase1_every} "
         f"phase1_mix_start={args.svd_phase1_mix_start:.3f} phase1_mix_end={args.svd_phase1_mix_end:.3f} "
-        f"phase2_mix={args.svd_phase2_mix:.3f} phase2_mix_end={args.svd_phase2_mix_end:.3f} "
-        f"phase2_ramp_steps={args.svd_phase2_ramp_steps} "
-        f"transition_step={args.svd_transition_step} balance_factors={args.svd_balance_factors} "
+        f"balance_factors={args.svd_balance_factors} "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
         f"use_qkv={args.svd_use_qkv} rank_qk={args.svd_rank_qk} rank_v={args.svd_rank_v} "
@@ -1091,9 +1092,7 @@ def main() -> None:
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     svd_aux = SVD3AuxManager(base_model, args)
-    transition_step = 0 if args.svd_transition_from_step0 else (
-        args.svd_transition_step if args.svd_transition_step > 0 else args.svd_phase2_start
-    )
+    transition_step = 0 if args.svd_transition_from_step0 else max(int(args.svd_transition_step), 1)
     transitioned = False
 
     def zero_grad_all() -> None:
@@ -1155,9 +1154,7 @@ def main() -> None:
     # warmdown schedule isn't thrown off by the growing per-step SVD overhead.
     stable_step_ms: float | None = None
 
-    first_svd_start = min(
-        [s for s in [args.svd_phase1_start, args.svd_phase2_start] if s > 0] or [300]
-    )
+    first_svd_start = min([s for s in [args.svd_phase1_start, transition_step] if s > 0] or [300])
     STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
     step = 0
@@ -1203,13 +1200,13 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         step_1idx = step + 1
-        phase, svd_mix = svd3_phase_and_mix(step_1idx, args)
-        aux_active = phase == 1 and step_1idx >= args.svd_phase1_start
-        if aux_active and svd3_is_refresh_step(step_1idx, args):
+        svd_mix = svd3_phase1_mix(step_1idx, args, transition_step=transition_step)
+        aux_active = (not transitioned) and step_1idx >= args.svd_phase1_start
+        if aux_active and svd3_is_phase1_refresh_step(step_1idx, args):
             svd_t0 = time.perf_counter()
-            stats = svd_aux.refresh_targets(step_1idx, phase=1)
+            stats = svd_aux.refresh_targets(step_1idx)
             log0(
-                f"svd3_refresh step:{step_1idx} phase:1 layers:{stats.num_layers} "
+                f"svd3_refresh step:{step_1idx} layers:{stats.num_layers} "
                 f"avg_residual:{stats.avg_residual:.4f} lambda:{svd_mix:.4f} "
                 f"took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
                 console=False,
@@ -1235,15 +1232,16 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            aux_prev = svd_aux.aux_loss
+            if svd_aux.active:
+                svd_aux.begin_micro_step()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            aux_delta = svd_aux.aux_loss - aux_prev if svd_aux.active else torch.zeros_like(loss)
+            aux_delta = svd_aux.end_micro_step() if svd_aux.active else torch.zeros_like(loss)
             total_loss = loss + svd_mix * aux_delta if svd_aux.active else loss
             (total_loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        aux_loss_scalar = float((svd_aux.aux_loss / grad_accum_steps).detach().item()) if svd_aux.active else 0.0
+        aux_loss_scalar = float((svd_aux.aux_loss_accum / grad_accum_steps).detach().item()) if svd_aux.active else 0.0
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1276,7 +1274,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"aux_loss:{aux_loss_scalar:.5f} svd_lambda:{svd_mix:.4f} "
-                f"svd_phase:{phase} transitioned:{int(transitioned)} "
+                f"transitioned:{int(transitioned)} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
