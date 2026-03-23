@@ -17,7 +17,6 @@ import sys
 import time
 import uuid
 import zlib
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -93,15 +92,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    svd_phase1_start = int(os.environ.get("SVD_PHASE1_START", 0))
-    svd_phase1_every = int(os.environ.get("SVD_PHASE1_EVERY", 50))
-    svd_phase1_mix_start = float(os.environ.get("SVD_PHASE1_MIX_START", 0.01))
-    svd_phase1_mix_end = float(os.environ.get("SVD_PHASE1_MIX_END", 0.5))
-    # Defaults to legacy SVD_PHASE2_START for backwards compatibility with the svd2-style launch command.
-    svd_transition_step = int(os.environ.get("SVD_TRANSITION_STEP", os.environ.get("SVD_PHASE2_START", 4000)))
-    svd_transition_from_step0 = bool(int(os.environ.get("SVD_TRANSITION_FROM_STEP0", "0")))
-    # If enabled, start directly with factorized layers and train only in SVD space.
-    svd_only_from_start = bool(int(os.environ.get("SVD_ONLY_FROM_START", "0")))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
+    # Factorized trainer: we initialize factorized layers once at startup.
     svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
@@ -119,7 +112,6 @@ class Hyperparameters:
     # Use separate iters for transition SVD (often can be cheaper than phase-1 refresh).
     svd_power_iters_phase2 = int(os.environ.get("SVD_POWER_ITERS_PHASE2", 0))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
-    svd_layer_stride = int(os.environ.get("SVD_LAYER_STRIDE", 1))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -737,21 +729,9 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
-def iter_named_svd_linears(
-    model: GPT,
-    args: Hyperparameters,
-    step_1idx: int,
-    use_stride: bool = True,
-) -> list[tuple[str, CastedLinear, int]]:
-    layer_stride = max(1, int(args.svd_layer_stride))
-    period = max(1, int(args.svd_phase1_every))
-    anchor = int(args.svd_phase1_start)
-    period_idx = max(step_1idx - anchor, 0) // period
-    layer_offset = period_idx % layer_stride
+def iter_named_svd_linears(model: GPT, args: Hyperparameters) -> list[tuple[str, CastedLinear, int]]:
     out: list[tuple[str, CastedLinear, int]] = []
     for layer_idx, block in enumerate(model.blocks):
-        if use_stride and layer_stride > 1 and layer_idx % layer_stride != layer_offset:
-            continue
         out.append((f"blocks.{layer_idx}.mlp.fc", block.mlp.fc, args.svd_rank_fc))
         out.append((f"blocks.{layer_idx}.mlp.proj", block.mlp.proj, args.svd_rank_proj))
         if args.svd_use_attn_proj:
@@ -780,93 +760,11 @@ def set_module_by_name(root: nn.Module, name: str, module: nn.Module) -> None:
         setattr(parent, leaf, module)
 
 
-@dataclass
-class SVD3AuxStats:
-    num_layers: int
-    avg_residual: float
-    aux_loss: Tensor
-
-
-class SVD3AuxManager:
-    def __init__(self, model: GPT, args: Hyperparameters):
-        self.model = model
-        self.args = args
-        self.active = False
-        self.selected_modules: list[tuple[CastedLinear, Tensor]] = []
-        self.aux_loss_accum = torch.zeros((), device=next(model.parameters()).device)
-        self._micro_aux: Tensor | None = None
-        self._active_handles: list[torch.utils.hooks.RemovableHandle] = []
-
-    def _make_hook(self, wr: Tensor):
-        def hook(module: nn.Module, inputs: tuple[Tensor, ...], output: Tensor):
-            x = inputs[0]
-            dense = output
-            proj = F.linear(x, wr.to(x.dtype), None)
-            layer_aux = F.mse_loss(dense, proj, reduction="mean")
-            self._micro_aux = layer_aux if self._micro_aux is None else self._micro_aux + layer_aux
-            self.aux_loss_accum = self.aux_loss_accum + layer_aux.detach()
-        return hook
-
-    @torch.no_grad()
-    def refresh_targets(self, step_1idx: int) -> SVD3AuxStats:
-        selected = iter_named_svd_linears(self.model, self.args, step_1idx, use_stride=True)
-        self.selected_modules = []
-        residual_sum = 0.0
-        for _, module, rank in selected:
-            wr, residual = truncated_svd_weight(module.weight, rank, self.args, niter=self.args.svd_power_iters)
-            self.selected_modules.append((module, wr.detach()))
-            residual_sum += residual
-        avg_residual = residual_sum / max(len(selected), 1)
-        return SVD3AuxStats(num_layers=len(selected), avg_residual=avg_residual, aux_loss=self.aux_loss_accum.detach())
-
-    def begin_step(self, active: bool) -> None:
-        self.active = active
-        self.aux_loss_accum = torch.zeros((), device=next(self.model.parameters()).device)
-        self._micro_aux = None
-        self._clear_active_handles()
-
-    def _clear_active_handles(self) -> None:
-        for handle in self._active_handles:
-            handle.remove()
-        self._active_handles.clear()
-
-    def begin_micro_step(self) -> None:
-        self._micro_aux = None
-        if not self.active:
-            return
-        self._clear_active_handles()
-        for module, wr in self.selected_modules:
-            self._active_handles.append(module.register_forward_hook(self._make_hook(wr)))
-
-    def end_micro_step(self) -> Tensor:
-        self._clear_active_handles()
-        if self._micro_aux is None:
-            return torch.zeros((), device=next(self.model.parameters()).device)
-        return self._micro_aux
-
-
-def svd3_phase1_mix(step_1idx: int, args: Hyperparameters, transition_step: int) -> float:
-    if step_1idx < args.svd_phase1_start:
-        return 0.0
-    denom = max(transition_step - args.svd_phase1_start, 1)
-    progress = min(max((step_1idx - args.svd_phase1_start) / denom, 0.0), 1.0)
-    mix = args.svd_phase1_mix_start + progress * (args.svd_phase1_mix_end - args.svd_phase1_mix_start)
-    return max(0.0, min(float(mix), 1.0))
-
-
-def svd3_is_phase1_refresh_step(step_1idx: int, args: Hyperparameters) -> bool:
-    return (
-        step_1idx >= args.svd_phase1_start
-        and args.svd_phase1_every > 0
-        and (step_1idx - args.svd_phase1_start) % args.svd_phase1_every == 0
-    )
-
-
 @torch.no_grad()
 def transition_to_factorized(model: GPT, args: Hyperparameters, step_1idx: int) -> tuple[int, float]:
     converted = 0
     residual_sum = 0.0
-    for name, dense, rank in iter_named_svd_linears(model, args, step_1idx, use_stride=False):
+    for name, dense, rank in iter_named_svd_linears(model, args):
         fact = FactorizedLinear(
             in_features=dense.in_features,
             out_features=dense.out_features,
@@ -999,26 +897,20 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-
     restore_low_dim_params_to_fp32(base_model)
 
-    # always transition to factorized weights at step 0 and train only in SVD space
+    # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
+    # distributed reducers/parameter buckets are built from the final trainable params.
     converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
-    log0(
-        f"svd3_startup_transition converted_layers:{converted} "
-        f"avg_residual:{avg_residual:.4f}"
+    compiled_model: nn.Module = (
+        torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
+        if args.compile_model
+        else base_model
     )
-
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-
-    model: nn.Module = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
-        if distributed else compiled_model
-    )
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
         block_named_params = list(base_model.blocks.named_parameters())
@@ -1092,8 +984,8 @@ def main() -> None:
         f"use_qkv={args.svd_use_qkv} rank_qk={args.svd_rank_qk} rank_v={args.svd_rank_v} "
         f"method={args.svd_method} power_iters={args.svd_power_iters} power_iters_phase2={args.svd_power_iters_phase2} "
         f"oversample={args.svd_oversample} "
-        f"layer_stride={args.svd_layer_stride} "
     )
+    log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")
     log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
     log0(f"seed:{args.seed}")
 
@@ -1166,8 +1058,7 @@ def main() -> None:
     first_svd_start = 300
     STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
-    step = 0
-    while True:
+    for step in range(args.iterations + 1):
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         # Skip step-0 validation: it is expensive and not useful when profiling throughput.
@@ -1231,7 +1122,6 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         # Capture a stable per-step time estimate before phase-2 SVD overhead starts.
@@ -1246,7 +1136,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / max(step, 1):.2f}ms"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1256,7 +1146,7 @@ def main() -> None:
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
-            stop_after_step = step
+            stop_after_step = step + 1
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
