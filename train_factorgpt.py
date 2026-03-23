@@ -278,7 +278,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], args: Hyperparameter
     return quantize_state_dict_int8_np(
         np_state,
         keep_float_fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
-        svd_rank_lookup=lambda name: None,
+        svd_rank_lookup=lambda name: 0,
         svd_export_dtype=export_np_dtype(args.factorized_export_float_dtype),
     )
 
