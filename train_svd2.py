@@ -488,7 +488,26 @@ def eval_val(
 
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    if rank == 0:
+        print(
+            "DEBUG eval:",
+            "val_token_count=", float(val_token_count.item()),
+            "val_byte_count=", float(val_byte_count.item()),
+            "base_bytes_nonzero=", int((base_bytes_lut > 0).sum().item()),
+            "base_bytes_sum=", int(base_bytes_lut.sum().item()),
+            "base_bytes_max=", int(base_bytes_lut.max().item()),
+        )
+
+    byte_count = val_byte_count.item()
+    token_count = val_token_count.item()
+    if byte_count <= 0:
+        raise RuntimeError(
+            f"eval_val produced non-positive byte_count={byte_count}, "
+            f"token_count={token_count}, "
+            f"base_bytes_nonzero={(base_bytes_lut > 0).sum().item()}, "
+            f"base_bytes_sum={base_bytes_lut.sum().item()}"
+        )
+    tokens_per_byte = token_count / byte_count
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
@@ -942,6 +961,12 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    if rank == 0:
+        print("DEBUG tokenizer:")
+        print("sp.vocab_size() =", int(sp.vocab_size()))
+        print("lut_nonzero =", int((base_bytes_lut > 0).sum().item()))
+        print("lut_sum =", int(base_bytes_lut.sum().item()))
+        print("first_32 =", base_bytes_lut[:32].tolist())
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
