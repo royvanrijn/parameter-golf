@@ -64,8 +64,20 @@ def run_search(input_path, max_combos=20):
     print("Loading checkpoint...")
     base_sd = torch.load(input_path, map_location="cpu")
 
-    args = Hyperparameters()
-    model = GPT(args)
+    # Reconstruct model with same hyperparameters as checkpoint
+    h = Hyperparameters()
+    model = GPT(
+        num_layers=h.num_layers,
+        model_dim=h.model_dim,
+        num_heads=h.num_heads,
+        num_kv_heads=h.num_kv_heads,
+        mlp_mult=h.mlp_mult,
+        tie_embeddings=h.tie_embeddings,
+        tied_embed_init_std=h.tied_embed_init_std,
+        logit_softcap=h.logit_softcap,
+        rope_base=h.rope_base,
+        qk_gain_init=h.qk_gain_init,
+    )
 
     mlp_ranks = [512, 384, 320, 256, 192]
     attn_ranks = [512, 384, 320, 256]
