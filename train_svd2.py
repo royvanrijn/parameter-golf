@@ -456,9 +456,11 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    local_loss_sum = 0.0
+    local_token_count = 0
+    local_byte_count = 0.0
+    num_eval_batches = 0
 
     model.eval()
     with torch.no_grad():
@@ -472,21 +474,51 @@ def eval_val(
             with sdpa_kernel([SDPBackend.MATH]):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+            batch_token_count = int(y.numel())
+            local_loss_sum += float(batch_loss.item()) * batch_token_count
+            local_token_count += batch_token_count
+            local_byte_count += float(token_bytes.sum().item())
+            num_eval_batches += 1
 
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+    if rank == 0:
+        print(
+            "DEBUG eval setup:",
+            "local_batch_tokens=", local_batch_tokens,
+            "local_batch_seqs=", local_batch_seqs,
+            "total_seqs=", total_seqs,
+            "seq_start=", seq_start,
+            "seq_end=", seq_end,
+            "num_eval_batches=", num_eval_batches,
+        )
 
-    val_loss = val_loss_sum / val_token_count
+    if dist.is_available() and dist.is_initialized() and world_size > 1:
+        packed = torch.tensor(
+            [local_loss_sum, float(local_token_count), local_byte_count],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        loss_sum = float(packed[0].item())
+        token_count = float(packed[1].item())
+        byte_count = float(packed[2].item())
+    else:
+        loss_sum = float(local_loss_sum)
+        token_count = float(local_token_count)
+        byte_count = float(local_byte_count)
+
+    if token_count <= 0 or byte_count <= 0:
+        raise RuntimeError(
+            f"eval_val produced non-positive counts: "
+            f"token_count={token_count}, byte_count={byte_count}, "
+            f"num_eval_batches={num_eval_batches}, "
+            f"local_batch_seqs={local_batch_seqs}, total_seqs={total_seqs}, "
+            f"seq_start={seq_start}, seq_end={seq_end}"
+        )
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count / byte_count
+
     bits_per_token = val_loss.item() / math.log(2.0)
     if rank == 0:
         print(
