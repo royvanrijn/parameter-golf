@@ -1003,6 +1003,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
+    # distributed reducers/parameter buckets are built from the final trainable params.
+    converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
@@ -1079,6 +1083,7 @@ def main() -> None:
         f"oversample={args.svd_oversample} "
         f"layer_stride={args.svd_layer_stride} "
     )
+    log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1087,9 +1092,6 @@ def main() -> None:
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     # train_svd3 simplified mode: always transition to factorized weights at step 0 and train only in SVD space.
-    svd_aux = None
-    transition_step = 0
-    transitioned = False
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1154,10 +1156,6 @@ def main() -> None:
     STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
     step = 0
-    converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
-    optimizers, optimizer_muon = build_optimizers()
-    transitioned = True
-    log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1237,7 +1235,6 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"transitioned:{int(transitioned)} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
