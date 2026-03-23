@@ -59,6 +59,75 @@ def apply_svd_config(state_dict, mlp_rank, attn_rank):
     return sd
 
 # ---------------------------
+# Full eval + size (reuse train_gpt logic)
+# ---------------------------
+
+from train_gpt import (
+    quantize_state_dict_int8,
+    dequantize_state_dict_int8,
+    eval_val,
+    build_sentencepiece_luts,
+    load_validation_tokens,
+    Hyperparameters,
+)
+import sentencepiece as spm
+import zlib, io, glob
+from pathlib import Path
+
+
+def evaluate_model(state_dict):
+    args = Hyperparameters()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # build model exactly like train_gpt
+    model = GPT(
+        vocab_size=args.vocab_size,
+        num_layers=args.num_layers,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init,
+    ).to(device).bfloat16()
+
+    model.load_state_dict(state_dict, strict=True)
+
+    # tokenizer + validation setup
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+        sp, args.vocab_size, device
+    )
+
+    val_loss, val_bpb = eval_val(
+        args,
+        model,
+        rank=0,
+        world_size=1,
+        device=device,
+        grad_accum_steps=1,
+        val_tokens=val_tokens,
+        base_bytes_lut=base_bytes_lut,
+        has_leading_space_lut=has_leading_space_lut,
+        is_boundary_token_lut=is_boundary_token_lut,
+    )
+
+    return val_loss, val_bpb
+
+
+def compute_size(state_dict):
+    quant_obj, _ = quantize_state_dict_int8(state_dict)
+    buf = io.BytesIO()
+    torch.save(quant_obj, buf)
+    raw = buf.getvalue()
+    return len(zlib.compress(raw))
+
+
+# ---------------------------
 # Search
 # ---------------------------
 
@@ -69,7 +138,6 @@ def run_search(input_path, max_combos=20):
     # Reconstruct model with same hyperparameters as checkpoint
     h = Hyperparameters()
     model = GPT(
-        vocab_size=h.vocab_size,
         num_layers=h.num_layers,
         model_dim=h.model_dim,
         num_heads=h.num_heads,
@@ -100,14 +168,9 @@ def run_search(input_path, max_combos=20):
 
         sd = apply_svd_config(base_sd, mlp_r, attn_r)
 
-        size_bytes = estimate_int8_zlib_size(sd)
+        size_bytes = compute_size(sd)
 
-        model.load_state_dict(sd, strict=False)
-        try:
-            val_loss, val_bpb = eval_val(model)
-        except TypeError:
-            # fallback: skip eval if signature mismatch
-            val_loss, val_bpb = float('nan'), float('nan')
+        val_loss, val_bpb = evaluate_model(sd)
 
         dt = time.time() - t0
 
