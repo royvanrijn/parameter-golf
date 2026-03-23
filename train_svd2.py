@@ -313,8 +313,10 @@ def should_apply_svd_projection(step_1idx: int, model: nn.Module, args: Hyperpar
     if not sample_targets:
         return False, 0.0, 0.0, phase
     residual_sum = 0.0
+
+    niter_override = args.svd_power_iters_phase2 if phase == 2 else None
     for weight, rank in sample_targets:
-        _, residual = truncated_svd_weight(weight, rank, 1.0, args)
+        _, residual = truncated_svd_weight(weight, rank, 1.0, args, niter=niter_override)
         residual_sum += residual
     avg_residual = residual_sum / len(sample_targets)
     return avg_residual >= threshold, mix, avg_residual, phase
@@ -1096,7 +1098,7 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
-
+    qat_tail_active = False
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1105,7 +1107,11 @@ def main() -> None:
     # Captured once after the model has warmed up (SVD not yet running) so the
     # warmdown schedule isn't thrown off by the growing per-step SVD overhead.
     stable_step_ms: float | None = None
-    STABLE_STEP_CAPTURE = 300  # capture after 300 steps — past warmup, before phase2 SVD
+
+    first_svd_start = min(
+        [s for s in [args.svd_phase1_start, args.svd_phase2_start] if s > 0] or [300]
+    )
+    STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
     step = 0
     while True:
@@ -1170,7 +1176,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         apply_svd, svd_mix, adaptive_probe, svd_phase = should_apply_svd_projection(step + 1, base_model, args)
-        if apply_svd:
+        if apply_svd and not qat_tail_active:
             svd_t0 = time.perf_counter()
             svd_stats = apply_periodic_svd_projection(base_model, args, step + 1, svd_mix, svd_phase)
             log0(
@@ -1230,6 +1236,7 @@ def main() -> None:
                     for weight, rank in all_targets:
                         projected, _ = truncated_svd_weight(weight, rank, 1.0, args, niter=0)
                         weight.copy_(projected)
+                qat_tail_active = True
                 stop_after_step = step + qat_steps
             else:
                 stop_after_step = step
