@@ -61,18 +61,20 @@ Total submission size int8+zlib: 13504067 bytes
 final_int8_zlib_roundtrip val_loss:2.2550 val_bpb:1.3356 eval_time:10655ms
 final_int8_zlib_roundtrip_exact val_loss:2.25503928 val_bpb:1.33556128
 
-root@d229d964c611:/workspace/parameter-golf# RUN_ID=svd_sp1024 DATA_PATH=./data/datasets/fineweb10B_sp1024/ TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 SVD_EVERY=4 SVD_MIX=0.5 MLP_MULT=3 torchrun --standalone --nproc_per_node=1 train_svdgpt.py
+Best run with SVD-aware training, slightly slower/worse, but much higher compression:
+
+root@d229d964c611:/workspace/parameter-golf# RUN_ID=svd_sp1024 DATA_PATH=./data/datasets/fineweb10B_sp1024/ TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 SVD_EVERY=4 SVD_MIX=0.75 MLP_MULT=2 torchrun --standalone --nproc_per_node=1 train_svdgpt.py
 logs/svd_sp1024.txt
 val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
 train_loader:dataset:fineweb10B_sp1024 train_shards:10
 val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
-model_params:21778504
+model_params:17059912
 world_size:1 grad_accum_steps:8
 sdp_backends:cudnn=False flash=True mem_efficient=False math=False
 attention_mode:gqa num_heads:8 num_kv_heads:4
 tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
 train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
-svd_training: every=4 mix=0.500 rank_fc=64 rank_proj=64 rank_attn_proj=64
+svd_training: every=4 mix=0.750 rank_fc=64 rank_proj=64 rank_attn_proj=64
 seed:1337
 warmup_step:1/20
 warmup_step:2/20
@@ -94,17 +96,29 @@ warmup_step:17/20
 warmup_step:18/20
 warmup_step:19/20
 warmup_step:20/20
-step:0/20000 val_loss:6.9378 val_bpb:4.1090 train_time:0ms step_avg:0.02ms
-step:1/20000 train_loss:6.9380 train_time:528ms step_avg:527.81ms
-step:2/20000 train_loss:17.0274 train_time:1044ms step_avg:522.03ms
-step:3/20000 train_loss:9.2164 train_time:1619ms step_avg:539.50ms
-svd_projection step:4 took_ms:628.9
-step:4/20000 train_loss:6.5567 train_time:2847ms step_avg:711.69ms
-step:5/20000 train_loss:6.5807 train_time:3400ms step_avg:679.94ms
-step:6/20000 train_loss:6.5969 train_time:3918ms step_avg:653.07ms
-step:7/20000 train_loss:6.2823 train_time:4522ms step_avg:646.01ms
-svd_projection step:8 took_ms:531.6
-step:8/20000 train_loss:6.1362 train_time:5689ms step_avg:711.15ms
-step:9/20000 train_loss:6.0495 train_time:6202ms step_avg:689.07ms
-step:10/20000 train_loss:5.9870 train_time:6720ms step_avg:672.02ms
-
+step:0/20000 val_loss:6.9357 val_bpb:4.1077 train_time:0ms step_avg:0.02ms
+step:1/20000 train_loss:6.9357 train_time:347ms step_avg:346.92ms
+step:2/20000 train_loss:16.7413 train_time:727ms step_avg:363.43ms
+step:3/20000 train_loss:8.7526 train_time:1106ms step_avg:368.55ms
+step:4/20000 train_loss:6.5884 train_time:2141ms step_avg:535.25ms
+step:5/20000 train_loss:6.6259 train_time:2651ms step_avg:530.14ms
+step:6/20000 train_loss:6.6578 train_time:3118ms step_avg:519.67ms
+step:7/20000 train_loss:6.3237 train_time:3518ms step_avg:502.51ms
+step:8/20000 train_loss:6.1833 train_time:4492ms step_avg:561.44ms
+step:9/20000 train_loss:6.1051 train_time:4939ms step_avg:548.78ms
+step:10/20000 train_loss:6.0364 train_time:5322ms step_avg:532.17ms
+step:200/20000 train_loss:2.9573 train_time:108914ms step_avg:544.57ms
+step:400/20000 train_loss:2.5583 train_time:221415ms step_avg:553.54ms
+step:600/20000 train_loss:2.6479 train_time:339642ms step_avg:566.07ms
+step:800/20000 train_loss:2.4930 train_time:469256ms step_avg:586.57ms
+step:1000/20000 train_loss:2.5205 train_time:600769ms step_avg:600.77ms
+step:1000/20000 val_loss:2.4962 val_bpb:1.4784 train_time:600772ms step_avg:600.77ms
+stopping_early: wallclock_cap train_time:600772ms step:1000/20000
+peak memory allocated: 10303 MiB reserved: 10554 MiB
+Serialized model: 67224983 bytes
+Code size: 45463 bytes
+Total submission size: 67270446 bytes
+serialized_model_int8_svd_zlib:5482189 bytes (payload:7748640 svd_factor_bytes:2403072 raw_pickle:7760773 payload_ratio:8.81x)
+Total submission size int8_svd+zlib: 5527652 bytes
+final_int8_svd_zlib_roundtrip val_loss:2.5180 val_bpb:1.4913 eval_time:10710ms
+final_int8_svd_zlib_roundtrip_exact val_loss:2.51796156 val_bpb:1.49127866
