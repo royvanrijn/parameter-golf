@@ -109,9 +109,6 @@ class Hyperparameters:
     svd_phase2_mix_end = float(os.environ.get("SVD_PHASE2_MIX_END", 1.0))
     # Steps over which phase-2 mix ramps from svd_phase2_mix to svd_phase2_mix_end.
     svd_phase2_ramp_steps = int(os.environ.get("SVD_PHASE2_RAMP_STEPS", 2000))
-    # Number of extra steps at the very end trained on already-projected (mix=1.0) weights.
-    # Acts as a lightweight QAT phase to recover from quantization error.
-    svd_qat_steps = int(os.environ.get("SVD_QAT_STEPS", 80))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
@@ -1046,7 +1043,6 @@ def main() -> None:
         f"oversample={args.svd_oversample} "
         f"layer_stride={args.svd_layer_stride} parallel_streams={args.svd_parallel_streams} "
         f"adaptive_threshold={args.svd_adaptive_threshold:.4f} adaptive_max_mats={args.svd_adaptive_max_mats} "
-        f"qat_steps={args.svd_qat_steps}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1106,7 +1102,6 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
-    qat_tail_active = False
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1152,7 +1147,7 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 log0(
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations} (includes qat_steps={args.svd_qat_steps})"
+                    f"step:{step}/{args.iterations}"
                 )
             break
 
@@ -1184,7 +1179,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         apply_svd, svd_mix, adaptive_probe, svd_phase = should_apply_svd_projection(step + 1, base_model, args)
-        if apply_svd and not qat_tail_active:
+        if apply_svd:
             svd_t0 = time.perf_counter()
             svd_stats = apply_periodic_svd_projection(base_model, args, step + 1, svd_mix, svd_phase)
             log0(
@@ -1220,34 +1215,7 @@ def main() -> None:
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
-            # On first cap hit: do a final full SVD projection at mix=1.0 (committing
-            # weights to exactly their low-rank form), then allow svd_qat_steps more
-            # training steps so the model adapts to the quantized representation.
-            qat_steps = max(0, int(args.svd_qat_steps))
-            if qat_steps > 0:
-                log0(f"wallclock_cap reached at step {step}: running final mix=1.0 SVD then {qat_steps} QAT steps")
-                all_targets = []
-                for block in base_model.blocks:
-                    all_targets += [
-                        (block.mlp.fc.weight, args.svd_rank_fc),
-                        (block.mlp.proj.weight, args.svd_rank_proj),
-                    ]
-                    if args.svd_use_attn_proj:
-                        all_targets.append((block.attn.proj.weight, args.svd_rank_attn_proj))
-                    if args.svd_use_qkv:
-                        all_targets += [
-                            (block.attn.c_q.weight, args.svd_rank_qk),
-                            (block.attn.c_k.weight, args.svd_rank_qk),
-                            (block.attn.c_v.weight, args.svd_rank_v),
-                        ]
-                with torch.no_grad():
-                    for weight, rank in all_targets:
-                        projected, _ = truncated_svd_weight(weight, rank, 1.0, args, niter=0)
-                        weight.copy_(projected)
-                qat_tail_active = True
-                stop_after_step = step + qat_steps
-            else:
-                stop_after_step = step
+            stop_after_step = step
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
