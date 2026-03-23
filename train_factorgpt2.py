@@ -645,7 +645,10 @@ class GPT(nn.Module):
         self.step_attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
         self.step_mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
         self.step_resid_mixes = nn.Parameter(
-            torch.stack((torch.ones(num_layers, model_dim), torch.zeros(num_layers, model_dim))).float()
+            torch.stack(
+                (torch.ones(num_layers, model_dim), torch.zeros(num_layers, model_dim)),
+                dim=1,
+            ).float()
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -666,14 +669,22 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        legacy_resid_layout = (
+            self.step_resid_mixes.ndim == 3
+            and self.step_resid_mixes.size(0) == 2
+            and self.step_resid_mixes.size(1) == self.num_layers
+        )
         for step in range(self.num_layers):
             block = self.blocks[step % self.num_unique_layers]
+            step_resid_mix = (
+                self.step_resid_mixes[:, step, :] if legacy_resid_layout else self.step_resid_mixes[step]
+            )
             x = block(
                 x,
                 x0,
                 step_attn_scale=self.step_attn_scales[step],
                 step_mlp_scale=self.step_mlp_scales[step],
-                step_resid_mix=self.step_resid_mixes[step],
+                step_resid_mix=step_resid_mix,
             )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
