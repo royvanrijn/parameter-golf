@@ -172,9 +172,12 @@ def truncated_svd_factors(
     max_rank = min(out_dim, in_dim)
     rank = max(1, min(int(rank), max_rank))
     if rank >= max_rank:
-        eye = torch.eye(max_rank, device=arr.device, dtype=arr.dtype)
-        a = arr @ eye
-        b = eye.T
+        if out_dim <= in_dim:
+            a = torch.eye(out_dim, device=arr.device, dtype=arr.dtype)
+            b = arr
+        else:
+            a = arr
+            b = torch.eye(in_dim, device=arr.device, dtype=arr.dtype)
         return a, b, 0.0
 
     if args.svd_method == "full":
