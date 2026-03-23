@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Reuse eval + model from your existing script
-from train_gpt import GPT, eval_val, Hyperparameters
+from train_experiment import GPT, eval_val, Hyperparameters
 
 # ---------------------------
 # Utils
@@ -138,6 +138,7 @@ def run_search(input_path, max_combos=20):
     # Reconstruct model with same hyperparameters as checkpoint
     h = Hyperparameters()
     model = GPT(
+        vocab_size=h.vocab_size,
         num_layers=h.num_layers,
         model_dim=h.model_dim,
         num_heads=h.num_heads,
