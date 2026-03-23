@@ -50,6 +50,7 @@ class Hyperparameters:
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -422,6 +423,7 @@ def build_materialized_eval_model(args: Hyperparameters, device: torch.device) -
     eval_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -572,12 +574,27 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        step_attn_scale: Tensor | None = None,
+        step_mlp_scale: Tensor | None = None,
+        step_resid_mix: Tensor | None = None,
+    ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
+        if step_resid_mix is not None:
+            mix = mix * step_resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_scale = self.attn_scale.to(dtype=x.dtype)
+        if step_attn_scale is not None:
+            attn_scale = attn_scale * step_attn_scale.to(dtype=x.dtype)
+        x = x + attn_scale[None, None, :] * attn_out
+        mlp_scale = self.mlp_scale.to(dtype=x.dtype)
+        if step_mlp_scale is not None:
+            mlp_scale = mlp_scale * step_mlp_scale.to(dtype=x.dtype)
+        x = x + mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -586,6 +603,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_unique_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -604,11 +622,11 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
+        if num_unique_layers <= 0:
+            num_unique_layers = num_layers
+        self.num_unique_layers = min(num_unique_layers, num_layers)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -621,8 +639,16 @@ class GPT(nn.Module):
                     factorized_attn_proj_rank,
                     factorized_mlp_proj_rank,
                 )
-                for _ in range(num_layers)
+                for _ in range(self.num_unique_layers)
             ]
+        )
+        self.step_attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+        self.step_mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+        self.step_resid_mixes = nn.Parameter(
+            torch.stack(
+                (torch.ones(num_layers, model_dim), torch.zeros(num_layers, model_dim)),
+                dim=1,
+            ).float()
         )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -643,15 +669,23 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        legacy_resid_layout = (
+            self.step_resid_mixes.ndim == 3
+            and self.step_resid_mixes.size(0) == 2
+            and self.step_resid_mixes.size(1) == self.num_layers
+        )
+        for step in range(self.num_layers):
+            block = self.blocks[step % self.num_unique_layers]
+            step_resid_mix = (
+                self.step_resid_mixes[:, step, :] if legacy_resid_layout else self.step_resid_mixes[step]
+            )
+            x = block(
+                x,
+                x0,
+                step_attn_scale=self.step_attn_scales[step],
+                step_mlp_scale=self.step_mlp_scales[step],
+                step_resid_mix=step_resid_mix,
+            )
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -750,6 +784,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -785,8 +820,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -823,6 +856,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"effective_depth:{args.num_layers} unique_layers:{base_model.num_unique_layers} "
+        f"repeat_factor:{args.num_layers / max(base_model.num_unique_layers, 1):.2f}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
