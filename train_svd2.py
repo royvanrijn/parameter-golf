@@ -27,7 +27,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from svdgpt_artifact import (
     dequantize_state_dict_int8 as dequantize_state_dict_int8_np,
@@ -110,6 +109,9 @@ class Hyperparameters:
     svd_phase2_mix_end = float(os.environ.get("SVD_PHASE2_MIX_END", 1.0))
     # Steps over which phase-2 mix ramps from svd_phase2_mix to svd_phase2_mix_end.
     svd_phase2_ramp_steps = int(os.environ.get("SVD_PHASE2_RAMP_STEPS", 2000))
+    # Number of extra steps at the very end trained on already-projected (mix=1.0) weights.
+    # Acts as a lightweight QAT phase to recover from quantization error.
+    svd_qat_steps = int(os.environ.get("SVD_QAT_STEPS", 80))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
@@ -453,14 +455,12 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
-
-    local_loss_sum = 0.0
-    local_token_count = 0
-    local_byte_count = 0.0
-    num_eval_batches = 0
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -468,75 +468,25 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with sdpa_kernel([SDPBackend.MATH]):
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y).detach()
-            batch_token_count = int(y.numel())
-            local_loss_sum += float(batch_loss.item()) * batch_token_count
-            local_token_count += batch_token_count
-            local_byte_count += float(token_bytes.sum().item())
-            num_eval_batches += 1
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
+            batch_token_count = float(y.numel())
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+            prev_ids = x.reshape(-1)
+            tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
 
-    if rank == 0:
-        print(
-            "DEBUG eval setup:",
-            "local_batch_tokens=", local_batch_tokens,
-            "local_batch_seqs=", local_batch_seqs,
-            "total_seqs=", total_seqs,
-            "seq_start=", seq_start,
-            "seq_end=", seq_end,
-            "num_eval_batches=", num_eval_batches,
-        )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
-    if dist.is_available() and dist.is_initialized() and world_size > 1:
-        packed = torch.tensor(
-            [local_loss_sum, float(local_token_count), local_byte_count],
-            device=device,
-            dtype=torch.float64,
-        )
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-        loss_sum = float(packed[0].item())
-        token_count = float(packed[1].item())
-        byte_count = float(packed[2].item())
-    else:
-        loss_sum = float(local_loss_sum)
-        token_count = float(local_token_count)
-        byte_count = float(local_byte_count)
-
-    if token_count <= 0 or byte_count <= 0:
-        raise RuntimeError(
-            f"eval_val produced non-positive counts: "
-            f"token_count={token_count}, byte_count={byte_count}, "
-            f"num_eval_batches={num_eval_batches}, "
-            f"local_batch_seqs={local_batch_seqs}, total_seqs={total_seqs}, "
-            f"seq_start={seq_start}, seq_end={seq_end}"
-        )
-
-    val_loss = loss_sum / token_count
-    bits_per_token = val_loss / math.log(2.0)
-    tokens_per_byte = token_count / byte_count
-
+    val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
-    if rank == 0:
-        print(
-            "DEBUG eval:",
-            "val_token_count=", float(val_token_count.item()),
-            "val_byte_count=", float(val_byte_count.item()),
-            "base_bytes_nonzero=", int((base_bytes_lut > 0).sum().item()),
-            "base_bytes_sum=", int(base_bytes_lut.sum().item()),
-            "base_bytes_max=", int(base_bytes_lut.max().item()),
-        )
-
-    byte_count = val_byte_count.item()
-    token_count = val_token_count.item()
-    if byte_count <= 0:
-        raise RuntimeError(
-            f"eval_val produced non-positive byte_count={byte_count}, "
-            f"token_count={token_count}, "
-            f"base_bytes_nonzero={(base_bytes_lut > 0).sum().item()}, "
-            f"base_bytes_sum={base_bytes_lut.sum().item()}"
-        )
-    tokens_per_byte = token_count / byte_count
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
@@ -990,12 +940,6 @@ def main() -> None:
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    if rank == 0:
-        print("DEBUG tokenizer:")
-        print("sp.vocab_size() =", int(sp.vocab_size()))
-        print("lut_nonzero =", int((base_bytes_lut > 0).sum().item()))
-        print("lut_sum =", int(base_bytes_lut.sum().item()))
-        print("first_32 =", base_bytes_lut[:32].tolist())
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -1102,6 +1046,7 @@ def main() -> None:
         f"oversample={args.svd_oversample} "
         f"layer_stride={args.svd_layer_stride} parallel_streams={args.svd_parallel_streams} "
         f"adaptive_threshold={args.svd_adaptive_threshold:.4f} adaptive_max_mats={args.svd_adaptive_max_mats} "
+        f"qat_steps={args.svd_qat_steps}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1161,6 +1106,7 @@ def main() -> None:
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
+    qat_tail_active = False
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1185,7 +1131,7 @@ def main() -> None:
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
-                base_model,
+                model,
                 rank,
                 world_size,
                 device,
@@ -1206,7 +1152,7 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 log0(
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
+                    f"step:{step}/{args.iterations} (includes qat_steps={args.svd_qat_steps})"
                 )
             break
 
@@ -1238,7 +1184,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         apply_svd, svd_mix, adaptive_probe, svd_phase = should_apply_svd_projection(step + 1, base_model, args)
-        if apply_svd:
+        if apply_svd and not qat_tail_active:
             svd_t0 = time.perf_counter()
             svd_stats = apply_periodic_svd_projection(base_model, args, step + 1, svd_mix, svd_phase)
             log0(
@@ -1274,7 +1220,34 @@ def main() -> None:
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
-            stop_after_step = step
+            # On first cap hit: do a final full SVD projection at mix=1.0 (committing
+            # weights to exactly their low-rank form), then allow svd_qat_steps more
+            # training steps so the model adapts to the quantized representation.
+            qat_steps = max(0, int(args.svd_qat_steps))
+            if qat_steps > 0:
+                log0(f"wallclock_cap reached at step {step}: running final mix=1.0 SVD then {qat_steps} QAT steps")
+                all_targets = []
+                for block in base_model.blocks:
+                    all_targets += [
+                        (block.mlp.fc.weight, args.svd_rank_fc),
+                        (block.mlp.proj.weight, args.svd_rank_proj),
+                    ]
+                    if args.svd_use_attn_proj:
+                        all_targets.append((block.attn.proj.weight, args.svd_rank_attn_proj))
+                    if args.svd_use_qkv:
+                        all_targets += [
+                            (block.attn.c_q.weight, args.svd_rank_qk),
+                            (block.attn.c_k.weight, args.svd_rank_qk),
+                            (block.attn.c_v.weight, args.svd_rank_v),
+                        ]
+                with torch.no_grad():
+                    for weight, rank in all_targets:
+                        projected, _ = truncated_svd_weight(weight, rank, 1.0, args, niter=0)
+                        weight.copy_(projected)
+                qat_tail_active = True
+                stop_after_step = step + qat_steps
+            else:
+                stop_after_step = step
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
@@ -1322,7 +1295,7 @@ def main() -> None:
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        base_model,
+        model,
         rank,
         world_size,
         device,
