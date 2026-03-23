@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Reuse eval + model from your existing script
-from train_experiment import GPT, eval_val, Hyperparameters
+from train_gpt import GPT, eval_val, Hyperparameters
 
 # ---------------------------
 # Utils
