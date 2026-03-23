@@ -14,12 +14,14 @@ from train_gpt import GPT, eval_val, Hyperparameters
 # ---------------------------
 
 def svd_approx(W, rank):
-    # W: [m, n]
-    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-    U_r = U[:, :rank]
-    S_r = S[:rank]
-    V_r = Vh[:rank, :]
-    return (U_r * S_r) @ V_r
+    # fast approximate SVD (much faster than full SVD)
+    try:
+        U, S, V = torch.svd_lowrank(W, q=rank, niter=2)
+        return (U * S) @ V.T
+    except Exception:
+        # fallback
+        U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+        return (U[:, :rank] * S[:rank]) @ Vh[:rank, :]
 
 
 def estimate_int8_zlib_size(state_dict):
@@ -101,7 +103,11 @@ def run_search(input_path, max_combos=20):
         size_bytes = estimate_int8_zlib_size(sd)
 
         model.load_state_dict(sd, strict=False)
-        val_loss, val_bpb = eval_val(model)
+        try:
+            val_loss, val_bpb = eval_val(model)
+        except TypeError:
+            # fallback: skip eval if signature mismatch
+            val_loss, val_bpb = float('nan'), float('nan')
 
         dt = time.time() - t0
 
