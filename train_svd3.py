@@ -1198,8 +1198,10 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         step_1idx = step + 1
         svd_mix = svd3_phase1_mix(step_1idx, args, transition_step=transition_step)
+
         refresh_due = (not transitioned) and svd3_is_phase1_refresh_step(step_1idx, args)
         aux_active = refresh_due
+
         if refresh_due:
             svd_t0 = time.perf_counter()
             stats = svd_aux.refresh_targets(step_1idx)
