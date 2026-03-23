@@ -92,7 +92,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_model = True
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
     # Factorized trainer: we initialize factorized layers once at startup.
     svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
@@ -158,6 +158,45 @@ def truncated_svd_weight(weight: Tensor, rank: int, args: Hyperparameters, niter
     low_rank = low_rank_approx(arr, rank, args, niter=niter)
     residual = float((arr - low_rank).norm() / (arr.norm() + 1e-8))
     return low_rank.to(dtype=weight.dtype), residual
+
+
+def truncated_svd_factors(
+    weight: Tensor,
+    rank: int,
+    args: Hyperparameters,
+    niter: int | None = None,
+    balanced: bool = True,
+) -> tuple[Tensor, Tensor, float]:
+    arr = weight.detach().float()
+    out_dim, in_dim = arr.shape
+    max_rank = min(out_dim, in_dim)
+    rank = max(1, min(int(rank), max_rank))
+    if rank >= max_rank:
+        eye = torch.eye(max_rank, device=arr.device, dtype=arr.dtype)
+        a = arr @ eye
+        b = eye.T
+        return a, b, 0.0
+
+    if args.svd_method == "full":
+        u, s, vh = torch.linalg.svd(arr, full_matrices=False)
+        u, s, vh = u[:, :rank], s[:rank], vh[:rank, :]
+    else:
+        power = int(args.svd_power_iters) if niter is None else niter
+        q = min(arr.shape[0], arr.shape[1], rank + max(1, args.svd_oversample))
+        q = max(rank, q)
+        u, s, v = torch.svd_lowrank(arr, q=q, niter=max(0, power))
+        u, s, vh = u[:, :rank], s[:rank], v[:, :rank].T
+
+    low_rank = (u * s) @ vh
+    residual = float((arr - low_rank).norm() / (arr.norm() + 1e-8))
+    if balanced:
+        sroot = torch.sqrt(torch.clamp(s, min=1e-12))
+        a = u * sroot
+        b = sroot[:, None] * vh
+    else:
+        a = u * s
+        b = vh
+    return a, b, residual
 
 
 class Muon(torch.optim.Optimizer):
@@ -462,10 +501,12 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Simple linear layer; relies on autocast/runtime kernels for compute dtype handling.
     def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        bias = self.bias
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
+        return F.linear(x, self.weight, bias)
 
 
 class FactorizedLinear(nn.Module):
@@ -481,33 +522,17 @@ class FactorizedLinear(nn.Module):
         nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
 
     def set_from_dense_weight(self, weight: Tensor, args: Hyperparameters, niter: int | None = None, balanced: bool = True) -> float:
-        arr = weight.detach().float()
-        max_rank = min(arr.shape[0], arr.shape[1], self.rank)
-        low_rank, residual = truncated_svd_weight(arr, max_rank, args, niter=niter)
-        if args.svd_method == "full":
-            u, s, vh = torch.linalg.svd(low_rank, full_matrices=False)
-            u, s, vh = u[:, :max_rank], s[:max_rank], vh[:max_rank, :]
-        else:
-            q = min(low_rank.shape[0], low_rank.shape[1], max_rank + max(1, args.svd_oversample))
-            q = max(max_rank, q)
-            u, s, v = torch.svd_lowrank(low_rank, q=q, niter=max(0, int(args.svd_power_iters_phase2)))
-            vh = v[:, :max_rank].T
-            u, s = u[:, :max_rank], s[:max_rank]
-        if balanced:
-            sroot = torch.sqrt(torch.clamp(s, min=1e-12))
-            a = u * sroot
-            b = sroot[:, None] * vh
-        else:
-            a = u * s
-            b = vh
+        a, b, residual = truncated_svd_factors(weight, self.rank, args, niter=niter, balanced=balanced)
         self.a.data.copy_(a.to(self.a.dtype).to(self.a.device))
         self.b.data.copy_(b.to(self.b.dtype).to(self.b.device))
         return residual
 
     def forward(self, x: Tensor) -> Tensor:
-        y = F.linear(x, self.b.to(x.dtype), None)
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(y, self.a.to(x.dtype), bias)
+        y = F.linear(x, self.b, None)
+        bias = self.bias
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
+        return F.linear(y, self.a, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -770,7 +795,7 @@ def transition_to_factorized(model: GPT, args: Hyperparameters, step_1idx: int) 
             out_features=dense.out_features,
             rank=rank,
             bias=dense.bias is not None,
-        ).to(device=dense.weight.device, dtype=torch.float32)
+        ).to(device=dense.weight.device, dtype=dense.weight.dtype)
         residual = fact.set_from_dense_weight(
             dense.weight,
             args=args,
@@ -897,9 +922,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
     restore_low_dim_params_to_fp32(base_model)
 
     # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
