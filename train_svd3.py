@@ -789,29 +789,14 @@ class SVD3AuxManager:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.model = model
         self.args = args
-        self.cached_wr: dict[str, Tensor] = {}
-        self.cached_residual: dict[str, float] = {}
         self.active = False
-        self.layer_names: set[str] = set()
+        self.selected_modules: list[tuple[CastedLinear, Tensor]] = []
         self.aux_loss_accum = torch.zeros((), device=next(model.parameters()).device)
         self._micro_aux: Tensor | None = None
-        self.handles = []
-        for name, module in model.named_modules():
-            if isinstance(module, CastedLinear):
-                self.handles.append(module.register_forward_hook(self._make_hook(name)))
+        self._active_handles: list[torch.utils.hooks.RemovableHandle] = []
 
-    def close(self) -> None:
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
-
-    def _make_hook(self, name: str):
+    def _make_hook(self, wr: Tensor):
         def hook(module: nn.Module, inputs: tuple[Tensor, ...], output: Tensor):
-            if not self.active or name not in self.layer_names:
-                return
-            wr = self.cached_wr.get(name)
-            if wr is None:
-                return
             x = inputs[0]
             dense = output
             proj = F.linear(x, wr.to(x.dtype), None)
@@ -823,12 +808,11 @@ class SVD3AuxManager:
     @torch.no_grad()
     def refresh_targets(self, step_1idx: int) -> SVD3AuxStats:
         selected = iter_named_svd_linears(self.model, self.args, step_1idx, use_stride=True)
-        self.layer_names = {name for name, _, _ in selected}
+        self.selected_modules = []
         residual_sum = 0.0
-        for name, module, rank in selected:
+        for _, module, rank in selected:
             wr, residual = truncated_svd_weight(module.weight, rank, self.args, niter=self.args.svd_power_iters)
-            self.cached_wr[name] = wr.detach()
-            self.cached_residual[name] = residual
+            self.selected_modules.append((module, wr.detach()))
             residual_sum += residual
         avg_residual = residual_sum / max(len(selected), 1)
         return SVD3AuxStats(num_layers=len(selected), avg_residual=avg_residual, aux_loss=self.aux_loss_accum.detach())
@@ -837,11 +821,23 @@ class SVD3AuxManager:
         self.active = active
         self.aux_loss_accum = torch.zeros((), device=next(self.model.parameters()).device)
         self._micro_aux = None
+        self._clear_active_handles()
+
+    def _clear_active_handles(self) -> None:
+        for handle in self._active_handles:
+            handle.remove()
+        self._active_handles.clear()
 
     def begin_micro_step(self) -> None:
         self._micro_aux = None
+        if not self.active:
+            return
+        self._clear_active_handles()
+        for module, wr in self.selected_modules:
+            self._active_handles.append(module.register_forward_hook(self._make_hook(wr)))
 
     def end_micro_step(self) -> Tensor:
+        self._clear_active_handles()
         if self._micro_aux is None:
             return torch.zeros((), device=next(self.model.parameters()).device)
         return self._micro_aux
@@ -1166,7 +1162,8 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        # Skip step-0 validation: it is expensive and not useful when profiling throughput.
+        should_validate = last_step or (args.val_loss_every > 0 and step > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
