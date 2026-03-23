@@ -252,7 +252,11 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    # NOTE: Use no_grad instead of inference_mode here. With torch.compile + staged
+    # progressive depth, validation can trigger a new compiled path right before
+    # training resumes, and inference tensors from inference_mode may then be seen
+    # by autograd on the next training step.
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
