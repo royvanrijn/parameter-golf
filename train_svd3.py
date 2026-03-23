@@ -1070,11 +1070,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"svd3_training: phase1_start={args.svd_phase1_start} transition_step={args.svd_transition_step} "
-        f"transition_from_step0={args.svd_transition_from_step0} "
-        f"svd_only_from_start={args.svd_only_from_start} "
-        f"phase1_every={args.svd_phase1_every} "
-        f"phase1_mix_start={args.svd_phase1_mix_start:.3f} phase1_mix_end={args.svd_phase1_mix_end:.3f} "
+        f"svd3_training: simplified_factorized_only=True transition_step=0 "
         f"balance_factors={args.svd_balance_factors} "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
@@ -1090,8 +1086,9 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    svd_aux = None if args.svd_only_from_start else SVD3AuxManager(base_model, args)
-    transition_step = 0 if (args.svd_only_from_start or args.svd_transition_from_step0) else max(int(args.svd_transition_step), 1)
+    # train_svd3 simplified mode: always transition to factorized weights at step 0 and train only in SVD space.
+    svd_aux = None
+    transition_step = 0
     transitioned = False
 
     def zero_grad_all() -> None:
@@ -1153,15 +1150,14 @@ def main() -> None:
     # warmdown schedule isn't thrown off by the growing per-step SVD overhead.
     stable_step_ms: float | None = None
 
-    first_svd_start = min([s for s in [args.svd_phase1_start, transition_step] if s > 0] or [300])
+    first_svd_start = 300
     STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
     step = 0
-    if transition_step == 0 and not transitioned:
-        converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
-        optimizers, optimizer_muon = build_optimizers()
-        transitioned = True
-        log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
+    converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
+    optimizers, optimizer_muon = build_optimizers()
+    transitioned = True
+    log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1199,56 +1195,17 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        step_1idx = step + 1
-        svd_mix = 0.0 if args.svd_only_from_start else svd3_phase1_mix(step_1idx, args, transition_step=transition_step)
-        refresh_due = (not transitioned) and (not args.svd_only_from_start) and svd3_is_phase1_refresh_step(step_1idx, args)
-        aux_active = refresh_due and svd_aux is not None
-        if refresh_due and svd_aux is not None:
-            svd_t0 = time.perf_counter()
-            stats = svd_aux.refresh_targets(step_1idx)
-            log0(
-                f"svd3_refresh step:{step_1idx} layers:{stats.num_layers} "
-                f"avg_residual:{stats.avg_residual:.4f} lambda:{svd_mix:.4f} "
-                f"took_ms:{1000.0 * (time.perf_counter() - svd_t0):.1f}",
-                console=False,
-            )
-
-        if (not transitioned) and step_1idx >= transition_step:
-            trans_t0 = time.perf_counter()
-            converted, avg_residual = transition_to_factorized(base_model, args, step_1idx)
-            optimizers, optimizer_muon = build_optimizers()
-            zero_grad_all()
-            transitioned = True
-            if svd_aux is not None:
-                svd_aux.begin_step(active=False)
-            log0(
-                f"svd3_transition step:{step_1idx} converted_layers:{converted} "
-                f"avg_residual:{avg_residual:.4f} "
-                f"took_ms:{1000.0 * (time.perf_counter() - trans_t0):.1f}",
-            )
-
-        if svd_aux is not None:
-            svd_aux.begin_step(active=aux_active and not transitioned)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            if svd_aux is not None and svd_aux.active:
-                svd_aux.begin_micro_step()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
-            aux_delta = svd_aux.end_micro_step() if (svd_aux is not None and svd_aux.active) else torch.zeros_like(loss)
-            total_loss = loss + svd_mix * aux_delta if (svd_aux is not None and svd_aux.active) else loss
-            (total_loss * grad_scale).backward()
+            (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        aux_loss_scalar = (
-            float((svd_aux.aux_loss_accum / grad_accum_steps).detach().item())
-            if (svd_aux is not None and svd_aux.active)
-            else 0.0
-        )
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1280,7 +1237,6 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"aux_loss:{aux_loss_scalar:.5f} svd_lambda:{svd_mix:.4f} "
                 f"transitioned:{int(transitioned)} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
