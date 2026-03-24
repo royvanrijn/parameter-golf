@@ -40,15 +40,15 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
-    iterations = int(os.environ.get("ITERATIONS", 3000))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 65_536))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 128))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 0.0))
+    iterations = int(os.environ.get("ITERATIONS", 20000))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    model_dim = int(os.environ.get("MODEL_DIM", 256))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     dropout = float(os.environ.get("DROPOUT", 0.0))
 
