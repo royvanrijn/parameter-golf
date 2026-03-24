@@ -84,10 +84,6 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -110,28 +106,6 @@ class Hyperparameters:
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
     svd_init_power_iters = int(os.environ.get("SVD_INIT_POWER_ITERS", os.environ.get("SVD_POWER_ITERS_PHASE2", 0)))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
-
-# -----------------------------
-# MUON OPTIMIZER
-# -----------------------------
-#
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
-
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
-    if transposed:
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    return X.T if transposed else X
 
 
 def low_rank_approx(arr: Tensor, rank: int, args: Hyperparameters, niter: int | None = None) -> Tensor:
@@ -195,66 +169,6 @@ def truncated_svd_factors(
         a = u * s
         b = vh
     return a, b, residual
-
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
-
-        for group in self.param_groups:
-            params = group["params"]
-            if not params:
-                continue
-            lr = group["lr"]
-            momentum = group["momentum"]
-            backend_steps = group["backend_steps"]
-            nesterov = group["nesterov"]
-
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
-
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
-
-        return loss
-
 
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP
@@ -933,7 +847,7 @@ def main() -> None:
     )
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
+    def build_optimizers() -> tuple[list[torch.optim.Optimizer]]:
         block_named_params = list(base_model.blocks.named_parameters())
 
         factor_params = []
@@ -955,7 +869,6 @@ def main() -> None:
 
         log0(
                 f"optimizer_split: factors={len(factor_params)} "
-                f"muon_matrices={len(matrix_params)} "
                 f"scalars={len(scalar_params)}"
             )
 
@@ -967,17 +880,6 @@ def main() -> None:
             eps=args.adam_eps,
             fused=True,
         )
-
-        optimizer_muon_local = None
-        if matrix_params:
-            optimizer_muon_local = Muon(
-                matrix_params,
-                lr=args.matrix_lr,
-                momentum=args.muon_momentum,
-                backend_steps=args.muon_backend_steps,
-            )
-            for group in optimizer_muon_local.param_groups:
-                group["base_lr"] = args.matrix_lr
 
         optimizer_factor_local = torch.optim.Adam(
             [{"params": factor_params, "lr": args.matrix_lr * 0.5, "base_lr": args.matrix_lr * 0.5}],
@@ -995,9 +897,6 @@ def main() -> None:
 
         opts: list[torch.optim.Optimizer] = [optimizer_tok_local]
 
-        if optimizer_muon_local is not None:
-            opts.append(optimizer_muon_local)
-
         if factor_params:
             opts.append(optimizer_factor_local)
 
@@ -1012,9 +911,9 @@ def main() -> None:
             )
             opts.insert(1, optimizer_head)
 
-        return opts, optimizer_muon_local
+        return opts
 
-    optimizers, optimizer_muon = build_optimizers()
+    optimizers = build_optimizers()
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
 
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -1163,11 +1062,6 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
