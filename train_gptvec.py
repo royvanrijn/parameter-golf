@@ -640,9 +640,12 @@ def main() -> None:
     log0(f"train_loader:shards pattern={args.train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
+    vec_setup_time_ms = 0.0
     vec_table_t = None
     vec_dim = None
     if args.use_vec_input or args.aux_vec_loss_weight > 0:
+        torch.cuda.synchronize()
+        vec_setup_t0 = time.perf_counter()
         if inline_vec_train:
             from vec_model import train_vec_model  # or whatever entrypoint you have
 
@@ -665,6 +668,8 @@ def main() -> None:
         vec_table_np = get_vec_table(payload)
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
+        torch.cuda.synchronize()
+        vec_setup_time_ms = 1000.0 * (time.perf_counter() - vec_setup_t0)
 
     base_model = GPTVecLM(args, vec_table_t).to(device).bfloat16()
     for module in base_model.modules():
@@ -791,7 +796,7 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     model.train()
-    training_time_ms = 0.0
+    training_time_ms = vec_setup_time_ms
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
