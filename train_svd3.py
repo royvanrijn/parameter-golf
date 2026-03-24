@@ -725,7 +725,6 @@ def set_module_by_name(root: nn.Module, name: str, module: nn.Module) -> None:
 @torch.no_grad()
 def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int, float]:
     converted = 0
-    avg_target_std_sum = 0.0
     for name, dense, rank in iter_named_svd_linears(model, args):
         fact = FactorizedLinear(
             in_features=dense.in_features,
@@ -733,13 +732,11 @@ def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int,
             rank=rank,
             bias=dense.bias is not None,
         ).to(device=dense.weight.device, dtype=dense.weight.dtype)
-        target_std = float(dense.weight.detach().float().std())
         if dense.bias is not None and fact.bias is not None:
             fact.bias.data.copy_(dense.bias.detach().float())
         set_module_by_name(model, name, fact)
         converted += 1
-        avg_target_std_sum += target_std
-    return converted, avg_target_std_sum / max(converted, 1)
+    return converted
 
 
 # -----------------------------
@@ -858,7 +855,7 @@ def main() -> None:
 
     # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
     # distributed reducers/parameter buckets are built from the final trainable params.
-    converted, avg_target_std = convert_model_to_factorized(base_model, args)
+    converted = convert_model_to_factorized(base_model, args)
     compiled_model: nn.Module = (
         torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
         if args.compile_model
@@ -937,7 +934,7 @@ def main() -> None:
         f"use_qkv={args.svd_use_qkv} rank_qkv={args.svd_rank_qkv} "
     )
     log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")
-    log0(f"factorized_init converted_layers:{converted} avg_dense_weight_std:{avg_target_std:.4f}")
+    log0(f"factorized_init converted_layers:{converted}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
