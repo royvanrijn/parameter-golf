@@ -774,132 +774,151 @@ def main() -> None:
     log0(f"train_loader:shards pattern={args.train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    def build_model_and_optimizers(model_args: Hyperparameters, vec_table: Tensor | None) -> tuple[GPTVecLM, nn.Module, list[torch.optim.Optimizer]]:
+        base_model = GPTVecLM(model_args, vec_table).to(device).bfloat16()
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module.float()
+        restore_low_dim_params_to_fp32(base_model)
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
+        block_named_params = list(base_model.blocks.named_parameters())
+        matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+        scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+        extra_scalar_names = {"final_norm.weight", "q_gain"}
+        for name, p in base_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.startswith("blocks.") or name in {"token_embedding.weight", "lm_head.weight", "vec_embedding.weight"}:
+                continue
+            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or any(t in name for t in extra_scalar_names):
+                scalar_params.append(p)
+            elif p.ndim == 2:
+                matrix_params.append(p)
+        matrix_unique: dict[int, nn.Parameter] = {}
+        for p in matrix_params:
+            matrix_unique[id(p)] = p
+        scalar_unique: dict[int, nn.Parameter] = {}
+        for p in scalar_params:
+            scalar_unique[id(p)] = p
+        for pid in list(scalar_unique.keys()):
+            if pid in matrix_unique:
+                del scalar_unique[pid]
+        matrix_params = list(matrix_unique.values())
+        scalar_params = list(scalar_unique.values())
+
+        token_lr = model_args.tied_embed_lr if model_args.tie_embeddings else model_args.embed_lr
+        optimizer_tok = torch.optim.Adam(
+            [{"params": [base_model.token_embedding.weight], "lr": token_lr, "base_lr": token_lr}],
+            betas=(model_args.beta1, model_args.beta2),
+            eps=model_args.adam_eps,
+            fused=True,
+        )
+        optimizer_muon = Muon(matrix_params, lr=model_args.matrix_lr, momentum=model_args.muon_momentum, backend_steps=model_args.muon_backend_steps)
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = model_args.matrix_lr
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": model_args.scalar_lr, "base_lr": model_args.scalar_lr}],
+            betas=(model_args.beta1, model_args.beta2),
+            eps=model_args.adam_eps,
+            fused=True,
+        )
+        optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+        if base_model.lm_head is not None:
+            optimizer_head = torch.optim.Adam(
+                [{"params": [base_model.lm_head.weight], "lr": model_args.head_lr, "base_lr": model_args.head_lr}],
+                betas=(model_args.beta1, model_args.beta2),
+                eps=model_args.adam_eps,
+                fused=True,
+            )
+            optimizers.insert(1, optimizer_head)
+
+        if getattr(base_model, "vec_embedding", None) is not None:
+            optimizer_vec = torch.optim.Adam(
+                [{"params": [base_model.vec_embedding.weight], "lr": model_args.embed_lr, "base_lr": model_args.embed_lr}],
+                betas=(model_args.beta1, model_args.beta2),
+                eps=model_args.adam_eps,
+                fused=True,
+            )
+            optimizers.append(optimizer_vec)
+
+        return base_model, model, optimizers
+
+    def zero_grad_all(optimizers: list[torch.optim.Optimizer]) -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    def run_warmup_steps(warm_model: nn.Module, warm_base_model: GPTVecLM, warm_optimizers: list[torch.optim.Optimizer]) -> None:
+        if args.warmup_steps <= 0:
+            return
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in warm_base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in warm_optimizers]
+        warm_model.train()
+        for warmup_step in range(args.warmup_steps):
+            zero_grad_all(warm_optimizers)
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    warm_model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                in_tok, tgt_tok = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits, _ = warm_model(in_tok)
+                    ce = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
+                    warmup_loss = ce
+                (warmup_loss * grad_scale).backward()
+            for opt in warm_optimizers:
+                opt.step()
+            zero_grad_all(warm_optimizers)
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        warm_base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(warm_optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all(warm_optimizers)
+        if distributed:
+            warm_model.require_backward_grad_sync = True
+
+    if args.warmup_steps > 0:
+        warmup_args = copy.copy(args)
+        warmup_args.use_vec_input = False
+        warmup_args.aux_vec_loss_weight = 0.0
+        warmup_base_model, warmup_model, warmup_optimizers = build_model_and_optimizers(warmup_args, None)
+        run_warmup_steps(warmup_model, warmup_base_model, warmup_optimizers)
+        del warmup_model, warmup_base_model, warmup_optimizers
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    vec_setup_time_ms = 0.0
     vec_table_t = None
     vec_dim = None
-    vec_setup_time_ms = 0.0
-
     if args.use_vec_input or args.aux_vec_loss_weight > 0:
+        torch.cuda.synchronize()
         vec_setup_t0 = time.perf_counter()
-
-        payload = None
-        vec_table_np = None
-
         if args.inline_vec_train:
             if master_process:
                 log0(f"[vec] training inline vec model for {args.vec_train_tokens} tokens")
-
-                # train vec on CPU, before GPT is allocated
-                payload = train_inline_vec_model(
-                    pattern=args.train_files,
-                    vocab_size=args.vocab_size,
-                    max_tokens=args.vec_train_tokens,
-                    dim=max(args.vec_proj_dim, 1),
-                    window=max(args.vec_train_window, 1),
-                    device=torch.device("cpu"),
-                )
-
-                if args.vec_path:
-                    save_vec_artifact(payload, args.vec_path)  # if you have this helper
-
-                vec_table_np = get_vec_table(payload)
+            payload = train_inline_vec_model(
+                pattern=args.train_files,
+                vocab_size=args.vocab_size,
+                max_tokens=args.vec_train_tokens,
+                dim=max(args.vec_proj_dim, 1),
+                window=max(args.vec_train_window, 1),
+                device=device,
+            )
+            if master_process:
                 log0("[vec] training done")
-
-            if distributed:
-                dist.barrier()
-
-            # simplest robust path: all ranks load the saved artifact after rank0 wrote it
-            if not master_process:
-                payload = load_vec_artifact(args.vec_path)
-                vec_table_np = get_vec_table(payload)
-
         else:
             payload = load_vec_artifact(args.vec_path)
-            vec_table_np = get_vec_table(payload)
 
-        if vec_table_np.shape[0] != args.vocab_size:
-            raise RuntimeError(
-                f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, args.vocab_size={args.vocab_size}"
-            )
-
+        vec_table_np = get_vec_table(payload)
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
+        torch.cuda.synchronize()
         vec_setup_time_ms = 1000.0 * (time.perf_counter() - vec_setup_t0)
 
-    base_model = GPTVecLM(args, vec_table_t).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
-    scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
-    extra_scalar_names = {"final_norm.weight", "q_gain"}
-    for name, p in base_model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if name.startswith("blocks.") or name in {"token_embedding.weight", "lm_head.weight", "vec_embedding.weight"}:
-            continue
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or any(t in name for t in extra_scalar_names):
-            scalar_params.append(p)
-        elif p.ndim == 2:
-            matrix_params.append(p)
-    matrix_unique: dict[int, nn.Parameter] = {}
-    for p in matrix_params:
-        matrix_unique[id(p)] = p
-    scalar_unique: dict[int, nn.Parameter] = {}
-    for p in scalar_params:
-        scalar_unique[id(p)] = p
-    for pid in list(scalar_unique.keys()):
-        if pid in matrix_unique:
-            del scalar_unique[pid]
-    matrix_params = list(matrix_unique.values())
-    scalar_params = list(scalar_unique.values())
-
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.token_embedding.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
-
-    if getattr(base_model, "vec_embedding", None) is not None:
-        optimizer_vec = torch.optim.Adam(
-            [{"params": [base_model.vec_embedding.weight], "lr": args.embed_lr, "base_lr": args.embed_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.append(optimizer_vec)
-
-    def zero_grad_all() -> None:
-        for opt in optimizers:
-            opt.zero_grad(set_to_none=True)
+    base_model, model, optimizers = build_model_and_optimizers(args, vec_table_t)
+    optimizer_muon = next(opt for opt in optimizers if isinstance(opt, Muon))
 
     n_params = sum(p.numel() for p in base_model.parameters())
     vec_state_bytes = 0
@@ -916,7 +935,6 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -929,39 +947,6 @@ def main() -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-
-    if args.warmup_steps > 0:
-        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
-        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
-        model.train()
-        for warmup_step in range(args.warmup_steps):
-            zero_grad_all()
-            for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                in_tok, tgt_tok = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    logits, vec_pred = model(in_tok)
-                    ce = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
-                    aux = torch.zeros((), device=device)
-                    if args.aux_vec_loss_weight > 0:
-                        if vec_pred is None or vec_table_t is None:
-                            raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
-                        aux = F.mse_loss(vec_pred, vec_table_t[tgt_tok])
-                    warmup_loss = ce + args.aux_vec_loss_weight * aux
-                (warmup_loss * grad_scale).backward()
-            for opt in optimizers:
-                opt.step()
-            zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
-        base_model.load_state_dict(initial_model_state, strict=True)
-        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
-            opt.load_state_dict(state)
-        zero_grad_all()
-        if distributed:
-            model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     model.train()
     training_time_ms = vec_setup_time_ms
@@ -992,7 +977,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
+        zero_grad_all(optimizers)
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -1023,7 +1008,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        zero_grad_all()
+        zero_grad_all(optimizers)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
