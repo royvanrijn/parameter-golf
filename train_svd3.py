@@ -501,17 +501,14 @@ class Rotary(nn.Module):
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    #half = x.size(-1) // 2
-    #x1, x2 = x[..., :half], x[..., half:]
-    #return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
     x = x.reshape(*x.shape[:-1], -1, 2)
     x0 = x[..., 0]
     x1 = x[..., 1]
-    y0 = x0 * cos - x1 * sin
-    y1 = x0 * sin + x1 * cos
-    return torch.stack((y0, y1), dim=-1).flatten(-2)
+    out = torch.empty_like(x)
+    out[..., 0] = x0 * cos - x1 * sin
+    out[..., 1] = x0 * sin + x1 * cos
+    return out.flatten(-2)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
