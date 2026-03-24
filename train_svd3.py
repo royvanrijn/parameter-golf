@@ -90,6 +90,8 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    adamw_weight_decay = float(os.environ.get("ADAMW_WEIGHT_DECAY", 0.04))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     compile_model = True
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
@@ -126,10 +128,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        weight_decay: float = 0.0,
+        nesterov: bool = True,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                weight_decay=weight_decay,
+                nesterov=nesterov,
+            ),
         )
 
     @torch.no_grad()
@@ -150,6 +166,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
+            weight_decay = group["weight_decay"]
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
@@ -177,6 +194,8 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
+                if weight_decay != 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
                 g = updates_flat[curr : curr + p.numel()].view_as(p)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -895,10 +914,11 @@ def main() -> None:
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         token_lr_local = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-        optimizer_tok_local = torch.optim.Adam(
+        optimizer_tok_local = torch.optim.AdamW(
             [{"params": [base_model.tok_emb.weight], "lr": token_lr_local, "base_lr": token_lr_local}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adamw_weight_decay,
             fused=True,
         )
         optimizer_muon_local = Muon(
@@ -906,21 +926,24 @@ def main() -> None:
             lr=args.matrix_lr,
             momentum=args.muon_momentum,
             backend_steps=args.muon_backend_steps,
+            weight_decay=args.muon_weight_decay,
         )
         for group in optimizer_muon_local.param_groups:
             group["base_lr"] = args.matrix_lr
-        optimizer_scalar_local = torch.optim.Adam(
+        optimizer_scalar_local = torch.optim.AdamW(
             [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adamw_weight_decay,
             fused=True,
         )
         opts: list[torch.optim.Optimizer] = [optimizer_tok_local, optimizer_muon_local, optimizer_scalar_local]
         if base_model.lm_head is not None:
-            optimizer_head = torch.optim.Adam(
+            optimizer_head = torch.optim.AdamW(
                 [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
                 betas=(args.beta1, args.beta2),
                 eps=args.adam_eps,
+                weight_decay=args.adamw_weight_decay,
                 fused=True,
             )
             opts.insert(1, optimizer_head)
@@ -937,7 +960,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
+        f"adamw_weight_decay:{args.adamw_weight_decay} muon_weight_decay:{args.muon_weight_decay}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
