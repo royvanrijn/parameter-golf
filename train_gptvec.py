@@ -78,6 +78,9 @@ class Hyperparameters:
     vec_proj_dim = int(os.environ.get("VEC_PROJ_DIM", 16))
     aux_vec_loss_weight = float(os.environ.get("AUX_VEC_LOSS_WEIGHT", 0.0))
 
+    inline_vec_train = bool(int(os.environ.get("INLINE_VEC_TRAIN", "0")))
+    vec_train_tokens = int(os.environ.get("VEC_TRAIN_TOKENS", 2_000_000))
+
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -640,10 +643,26 @@ def main() -> None:
     vec_table_t = None
     vec_dim = None
     if args.use_vec_input or args.aux_vec_loss_weight > 0:
-        payload = load_vec_artifact(args.vec_path)
+        if inline_vec_train:
+            from vec_model import train_vec_model  # or whatever entrypoint you have
+
+            if master_process:
+                log0(f"[vec] training inline vec model for {vec_train_tokens} tokens")
+
+            payload = train_vec_model(
+                pattern=args.train_files,
+                vocab_size=args.vocab_size,
+                max_tokens=vec_train_tokens,
+                dim=args.vec_proj_dim,   # or separate VEC_DIM if you want
+            )
+
+            if master_process:
+                log0("[vec] training done")
+
+        else:
+            payload = load_vec_artifact(args.vec_path)
+
         vec_table_np = get_vec_table(payload)
-        if vec_table_np.shape[0] != args.vocab_size:
-            raise RuntimeError(f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, args.vocab_size={args.vocab_size}")
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
 
