@@ -470,19 +470,6 @@ class FactorizedLinear(nn.Module):
 #        z2 = F.linear(y2, self.a, bias)
 #        return z2.view(*orig_shape, self.out_features)
 
-KEEP_FP32_NAME_PATTERNS = (
-    "resid_mix",
-    "skip_weights",
-)
-
-def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    with torch.no_grad():
-        for name, param in module.named_parameters():
-            if any(pattern in name for pattern in KEEP_FP32_NAME_PATTERNS):
-                if param.dtype != torch.float32:
-                    param.data = param.data.float()
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -642,7 +629,7 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = self.resid_mix
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale[None, None, :] * attn_out
@@ -715,7 +702,7 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.skip_weights[i][None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -889,7 +876,6 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    restore_low_dim_params_to_fp32(base_model)
 
     # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
     # distributed reducers/parameter buckets are built from the final trainable params.
