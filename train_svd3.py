@@ -177,7 +177,7 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                g = updates_flat[curr : curr + p.numel()].view_as(p)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -429,11 +429,7 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     # Simple linear layer; relies on autocast/runtime kernels for compute dtype handling.
     def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias
-        if bias is not None and bias.dtype != x.dtype:
-            bias = bias.to(x.dtype)
-        return F.linear(x, self.weight, bias)
-
+        return F.linear(x, self.weight, self.bias)
 
 class FactorizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = False):
@@ -457,10 +453,7 @@ class FactorizedLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         y = F.linear(x, self.b, None)
-        bias = self.bias
-        if bias is not None and bias.dtype != x.dtype:
-            bias = bias.to(x.dtype)
-        return F.linear(y, self.a, bias)
+        return F.linear(x, self.weight, self.bias)
 #       orig_shape = x.shape[:-1]
 #        x2 = x.reshape(-1, x.shape[-1])
 #        y2 = F.linear(x2, self.b, None)
@@ -993,8 +986,8 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        zero_grad_all()
         for warmup_step in range(args.warmup_steps):
-            zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1029,6 +1022,7 @@ def main() -> None:
 
     STABLE_STEP_CAPTURE = 100
 
+    zero_grad_all()
     for step in range(args.iterations + 1):
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
@@ -1066,7 +1060,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
