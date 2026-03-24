@@ -469,13 +469,17 @@ class FactorizedLinear(nn.Module):
 #        z2 = F.linear(y2, self.a, bias)
 #        return z2.view(*orig_shape, self.out_features)
 
+KEEP_FP32_NAME_PATTERNS = (
+    "resid_mix",
+    "skip_weights",
+)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
-                param.data = param.data.float()
+            if any(pattern in name for pattern in KEEP_FP32_NAME_PATTERNS):
+                if param.dtype != torch.float32:
+                    param.data = param.data.float()
 
 
 class Rotary(nn.Module):
@@ -559,7 +563,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q = q * self.q_gain[None, :, None, None]
 
         y = F.scaled_dot_product_attention(
             q,
@@ -610,10 +614,9 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale[None, None, :] * attn_out
+        x = x + self.mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
 
 class GPT(nn.Module):
     def __init__(
