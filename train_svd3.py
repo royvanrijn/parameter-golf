@@ -518,7 +518,7 @@ class FactorizedLinear(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 #        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
 #        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
-        scale = (1.0 / (self.rank * in_features)) ** 0.25
+        scale = (1.0 / (rank * in_features)) ** 0.25
 
         nn.init.normal_(self.a, mean=0.0, std=scale)
         nn.init.normal_(self.b, mean=0.0, std=scale)
