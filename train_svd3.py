@@ -435,7 +435,15 @@ class CastedLinear(nn.Linear):
 
 
 class FactorizedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        bias: bool = False,
+        init_scale_mul: float = 1.0,
+        orthogonal_b: bool = True,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
