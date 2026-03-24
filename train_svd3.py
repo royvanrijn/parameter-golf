@@ -466,19 +466,14 @@ class FactorizedLinear(nn.Module):
             nn.init.normal_(self.a, mean=0.0, std=std_a)
 
     def forward(self, x: Tensor) -> Tensor:
-        y = F.linear(x, self.b, None)
+        orig_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        y2 = F.linear(x2, self.b, None)
         bias = self.bias
-        if bias is not None and bias.dtype != x.dtype:
-            bias = bias.to(x.dtype)
-        return F.linear(y, self.a, bias)
-#       orig_shape = x.shape[:-1]
-#        x2 = x.reshape(-1, x.shape[-1])
-#        y2 = F.linear(x2, self.b, None)
-#        bias = self.bias
-#        if bias is not None and bias.dtype != x2.dtype:
-#            bias = bias.to(x2.dtype)
-#        z2 = F.linear(y2, self.a, bias)
-#        return z2.view(*orig_shape, self.out_features)
+        if bias is not None and bias.dtype != x2.dtype:
+            bias = bias.to(x2.dtype)
+        z2 = F.linear(y2, self.a, bias)
+        return z2.view(*orig_shape, self.out_features)
 
 KEEP_FP32_NAME_PATTERNS = (
     "resid_mix",
