@@ -71,6 +71,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    rope_dim = int(os.environ.get("ROPE_DIM", model_dim // num_heads))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -519,6 +520,7 @@ class CausalSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
+        rope_dim: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -533,10 +535,17 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        if rope_dim < 0:
+            raise ValueError(f"rope_dim must be non-negative, got {rope_dim}")
+        if rope_dim % 2 != 0:
+            raise ValueError(f"rope_dim must be even, got {rope_dim}")
+        if rope_dim > self.head_dim:
+            raise ValueError(f"rope_dim must be <= head_dim, got rope_dim={rope_dim}, head_dim={self.head_dim}")
 
         self.dim = dim
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.qkv_out_dim = dim + 2 * self.kv_dim
+        self.rope_dim = rope_dim
 
         # packed QKV projection: [q | k | v]
         self.c_qkv = CastedLinear(dim, self.qkv_out_dim, bias=False)
@@ -545,7 +554,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
 
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dim, base=rope_base) if self.rope_dim > 0 else None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -560,9 +569,16 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.rope_dim > 0:
+            q_rot, q_pass = q[..., : self.rope_dim], q[..., self.rope_dim :]
+            k_rot, k_pass = k[..., : self.rope_dim], k[..., self.rope_dim :]
+            if self.rotary is None:
+                raise RuntimeError("rotary cache is required when rope_dim > 0")
+            cos, sin = self.rotary(seqlen, x.device, q.dtype)
+            q_rot = apply_rotary_emb(q_rot, cos, sin)
+            k_rot = apply_rotary_emb(k_rot, cos, sin)
+            q = torch.cat((q_rot, q_pass), dim=-1)
+            k = torch.cat((k_rot, k_pass), dim=-1)
         q = q * self.q_gain[None, :, None, None]
 
         y = F.scaled_dot_product_attention(
@@ -598,13 +614,14 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        rope_dim: int,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_dim, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -630,6 +647,7 @@ class GPT(nn.Module):
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
+        rope_dim: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -651,6 +669,7 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
+                    rope_dim,
                     rope_base,
                     qk_gain_init,
                 )
@@ -852,6 +871,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
+        rope_dim=args.rope_dim,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
