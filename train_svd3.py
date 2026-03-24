@@ -442,7 +442,6 @@ class FactorizedLinear(nn.Module):
         rank: int,
         bias: bool = False,
         init_scale_mul: float = 1.0,
-        orthogonal_b: bool = True,
     ):
         super().__init__()
         self.in_features = in_features
@@ -456,14 +455,9 @@ class FactorizedLinear(nn.Module):
         std_a = init_scale_mul / math.sqrt(self.rank)
         scale_b = init_scale_mul / math.sqrt(in_features)
 
-        with torch.no_grad():
-            if orthogonal_b:
-                nn.init.orthogonal_(self.b)
-                self.b.mul_(scale_b)
-            else:
-                nn.init.normal_(self.b, mean=0.0, std=scale_b)
-
-            nn.init.normal_(self.a, mean=0.0, std=std_a)
+        nn.init.orthogonal_(self.b)   # or self.B depending on naming
+        self.b.mul_(scale_b)
+        nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(rank))
 
     def forward(self, x: Tensor) -> Tensor:
         y = F.linear(x, self.b, None)
@@ -519,12 +513,9 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    x = x.reshape(*x.shape[:-1], -1, 2)
-    x0 = x[..., 0]
-    x1 = x[..., 1]
-    y0 = x0 * cos - x1 * sin
-    y1 = x0 * sin + x1 * cos
-    return torch.stack((y0, y1), dim=-1).flatten(-2)
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -761,15 +752,11 @@ def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int,
             rank=rank,
             bias=dense.bias is not None,
             init_scale_mul=init_scale_mul,
-            orthogonal_b=True,
         ).to(device=dense.weight.device, dtype=dense.weight.dtype)
-
         if dense.bias is not None and fact.bias is not None:
             fact.bias.data.copy_(dense.bias.detach().float())
-
         set_module_by_name(model, name, fact)
         converted += 1
-
     return converted
 
 
