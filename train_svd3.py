@@ -953,6 +953,12 @@ def main() -> None:
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
 
+        log0(
+                f"optimizer_split: factors={len(factor_params)} "
+                f"muon_matrices={len(matrix_params)} "
+                f"scalars={len(scalar_params)}"
+            )
+
         token_lr_local = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
 
         optimizer_tok_local = torch.optim.Adam(
@@ -1010,12 +1016,6 @@ def main() -> None:
 
     optimizers, optimizer_muon = build_optimizers()
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-
-    log0(
-        f"optimizer_split: factors={len(factor_params)} "
-        f"muon_matrices={len(matrix_params)} "
-        f"scalars={len(scalar_params)}"
-    )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
