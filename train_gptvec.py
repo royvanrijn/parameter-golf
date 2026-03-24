@@ -23,8 +23,10 @@ from pathlib import Path
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from vec_model import get_vec_table, load_vec_artifact
 
@@ -121,6 +123,9 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
         for group in self.param_groups:
             params = group["params"]
             if not params:
@@ -129,20 +134,30 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            curr = 0
             for p in params:
-                if p.grad is None:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                p.add_(g.to(dtype=p.dtype), alpha=-lr)
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
         return loss
 
 
@@ -401,14 +416,14 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def load_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
-        raise ValueError(f"Token split is too short for TRAIN_SEQ_LEN={seq_len}")
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
 
 
@@ -437,27 +452,60 @@ def build_sentencepiece_luts(sp: spm.SentencePieceProcessor, vocab_size: int, de
     )
 
 
-def sample_batch(tokens: Tensor, train_batch_tokens: int, seq_len: int, device: torch.device) -> tuple[Tensor, Tensor]:
-    batch_size = train_batch_tokens // seq_len
-    if batch_size <= 0:
-        raise ValueError(f"TRAIN_BATCH_TOKENS must be >= TRAIN_SEQ_LEN, got {train_batch_tokens} < {seq_len}")
-    max_start = tokens.numel() - seq_len - 1
-    if max_start <= 0:
-        raise RuntimeError("Token stream too short for configured TRAIN_SEQ_LEN")
+class TokenStream:
+    def __init__(self, pattern: str):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
 
-    ix = torch.randint(0, max_start, (batch_size,), device=tokens.device)
-    offsets = torch.arange(seq_len + 1, device=tokens.device)
-    windows = tokens[ix[:, None] + offsets[None, :]]
+    def _advance_file(self) -> None:
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
 
-    x = windows[:, :-1].to(device=device, dtype=torch.long, non_blocking=True)
-    y = windows[:, 1:].to(device=device, dtype=torch.long, non_blocking=True)
-    return x, y
+    def take(self, n: int) -> Tensor:
+        chunks: list[Tensor] = []
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            chunks.append(self.tokens[self.pos : self.pos + k])
+            self.pos += k
+            remaining -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        per_rank_span = local_tokens + 1
+        chunk = self.stream.take(per_rank_span * self.world_size)
+        start = self.rank * per_rank_span
+        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        x = local[:-1].reshape(-1, seq_len)
+        y = local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
+    rank: int,
+    world_size: int,
     device: torch.device,
+    grad_accum_steps: int,
     val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
@@ -467,19 +515,22 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    local_batch_tokens = args.val_batch_size
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
 
     model.eval()
     with torch.inference_mode():
         total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-        for batch_seq_start in range(0, total_seqs, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, total_seqs)
+        seq_start = (total_seqs * rank) // world_size
+        seq_end = (total_seqs * (rank + 1)) // world_size
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
             raw_end = batch_seq_end * args.train_seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
@@ -500,6 +551,11 @@ def eval_val(
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
@@ -507,40 +563,78 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
+    code = Path(__file__).read_text(encoding="utf-8")
     args = parse_args()
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
+    if 8 % world_size != 0:
+        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    grad_accum_steps = 8 // world_size
+    grad_scale = 1.0 / grad_accum_steps
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    master_process = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+
+    logfile = None
+    if master_process:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg: str, console: bool = True) -> None:
+        if not master_process:
+            return
+        if console:
+            print(msg)
+        if logfile is not None:
+            with open(logfile, "a", encoding="utf-8") as f:
+                print(msg, file=f)
+
+    log0(code, console=False)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
-    if device.type == "cuda":
-        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
-
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{args.run_id}.txt"
-    print(logfile)
-
-    def log0(msg: str) -> None:
-        print(msg)
-        with open(logfile, "a", encoding="utf-8") as f:
-            print(msg, file=f)
-
-    log0(f"device:{device}")
+    torch.cuda.manual_seed_all(args.seed)
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}")
-
-    train_tokens = load_tokens(args.train_files, args.train_seq_len)
-    val_tokens = load_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
-
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log0(f"train_loader:shards pattern={args.train_files} tokens:{train_tokens.numel() - 1}")
+    log0(f"train_loader:shards pattern={args.train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     vec_table_t = None
@@ -553,77 +647,68 @@ def main() -> None:
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
 
-    base_model = GPTVecLM(args, vec_table_t).to(device)
-    if device.type == "cuda":
-        compiled_base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    else:
-        compiled_base_model = base_model
-    model: nn.Module = compiled_base_model
+    base_model = GPTVecLM(args, vec_table_t).to(device).bfloat16()
+    for module in base_model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(base_model)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    matrix_params: list[Tensor] = []
-    scalar_params: list[Tensor] = []
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
+    extra_scalar_names = {"final_norm.weight", "q_gain"}
     for name, p in base_model.named_parameters():
         if not p.requires_grad:
             continue
-        if name == "token_embedding.weight":
+        if name.startswith("blocks.") or name in {"token_embedding.weight", "lm_head.weight", "vec_embedding.weight"}:
             continue
-        if name == "lm_head.weight":
-            continue
-        if name == "vec_embedding.weight":
-            continue
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
-            matrix_params.append(p)
-        else:
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS) or any(t in name for t in extra_scalar_names):
             scalar_params.append(p)
+        elif p.ndim == 2:
+            matrix_params.append(p)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.token_embedding.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=(device.type == "cuda"),
+        fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
+    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
+    optimizer_scalar = torch.optim.Adam(
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_head)
 
     if getattr(base_model, "vec_embedding", None) is not None:
         optimizer_vec = torch.optim.Adam(
             [{"params": [base_model.vec_embedding.weight], "lr": args.embed_lr, "base_lr": args.embed_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
-            fused=(device.type == "cuda"),
+            fused=True,
         )
         optimizers.append(optimizer_vec)
-
-    if matrix_params:
-        optimizer_muon = Muon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon.param_groups:
-            group["base_lr"] = args.matrix_lr
-        optimizers.append(optimizer_muon)
-    else:
-        optimizer_muon = None
-
-    if scalar_params:
-        optimizer_scalar = torch.optim.Adam(
-            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=(device.type == "cuda"),
-        )
-        optimizers.append(optimizer_scalar)
-
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=(device.type == "cuda"),
-        )
-        optimizers.insert(1, optimizer_head)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -631,22 +716,15 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(
-        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
-        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
-    )
-    log0(
-        f"vec_path:{args.vec_path} use_vec_input:{args.use_vec_input} use_hybrid_embed:{args.use_hybrid_embed} "
-        f"freeze_vec:{args.freeze_vec} aux_vec_loss_weight:{args.aux_vec_loss_weight}"
-    )
-    log0(f"seed:{args.seed}")
 
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -654,9 +732,7 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            if warmdown_start <= step < args.iterations:
-                return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
-            return 1.0
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
@@ -668,17 +744,20 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
-            in_tok, tgt_tok = sample_batch(train_tokens, args.train_batch_tokens, args.train_seq_len, device=device)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                logits, vec_pred = model(in_tok)
-                warmup_ce = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
-                warmup_aux = torch.zeros((), device=device)
-                if args.aux_vec_loss_weight > 0:
-                    if vec_pred is None or vec_table_t is None:
-                        raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
-                    warmup_aux = F.mse_loss(vec_pred, vec_table_t[tgt_tok])
-                warmup_loss = warmup_ce + args.aux_vec_loss_weight * warmup_aux
-            warmup_loss.backward()
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                in_tok, tgt_tok = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits, vec_pred = model(in_tok)
+                    ce = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
+                    aux = torch.zeros((), device=device)
+                    if args.aux_vec_loss_weight > 0:
+                        if vec_pred is None or vec_table_t is None:
+                            raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
+                        aux = F.mse_loss(vec_pred, vec_table_t[tgt_tok])
+                    warmup_loss = ce + args.aux_vec_loss_weight * aux
+                (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -688,75 +767,66 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        if distributed:
+            model.require_backward_grad_sync = True
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     model.train()
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
     t0 = time.perf_counter()
-
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
-
         if should_validate:
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
-                args,
-                model,
-                device,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
+                args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
             if stop_after_step is not None and step < args.iterations:
-                log0(
-                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
-                )
+                log0(f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms step:{step}/{args.iterations}")
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        if optimizer_muon is not None:
-            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-            for group in optimizer_muon.param_groups:
-                group["momentum"] = muon_momentum
+        zero_grad_all()
+        train_loss = torch.zeros((), device=device)
+        for micro_step in range(grad_accum_steps):
+            if distributed:
+                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            in_tok, tgt_tok = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits, vec_pred = model(in_tok)
+                ce_loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
+                aux_loss = torch.zeros((), device=device)
+                if args.aux_vec_loss_weight > 0:
+                    if vec_pred is None or vec_table_t is None:
+                        raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
+                    aux_loss = F.mse_loss(vec_pred, vec_table_t[tgt_tok])
+                loss = ce_loss + args.aux_vec_loss_weight * aux_loss
+            train_loss += loss.detach()
+            (loss * grad_scale).backward()
+        train_loss /= grad_accum_steps
+
+        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        in_tok, tgt_tok = sample_batch(train_tokens, args.train_batch_tokens, args.train_seq_len, device=device)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits, vec_pred = model(in_tok)
-            ce_loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
-
-            aux_loss = torch.zeros((), device=device)
-            if args.aux_vec_loss_weight > 0:
-                if vec_pred is None or vec_table_t is None:
-                    raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
-                tgt_vec = vec_table_t[tgt_tok]
-                aux_loss = F.mse_loss(vec_pred, tgt_vec)
-
-            loss = ce_loss + args.aux_vec_loss_weight * aux_loss
-
-        zero_grad_all()
-        loss.backward()
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -765,37 +835,40 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0)
-        if should_log_train:
+        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
             log0(
-                f"step:{step}/{args.iterations} train_loss:{loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        if distributed and max_wallclock_ms is not None:
+            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
+            reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
     elapsed = training_time_ms / 1000.0
-
-    os.makedirs(Path(args.save_checkpoint).parent, exist_ok=True)
-    ckpt = {
-        "model_state": base_model.state_dict(),
-        "args": {k: getattr(args, k) for k in dir(args) if not k.startswith("_") and not callable(getattr(args, k))},
-        "vec_path": args.vec_path,
-        "vec_dim": vec_dim,
-        "train_seconds": elapsed,
-    }
-    torch.save(ckpt, args.save_checkpoint)
-
-    summary = {
-        "checkpoint": args.save_checkpoint,
-        "vec_path": args.vec_path,
-        "iterations": args.iterations,
-        "train_seconds": float(elapsed),
-        "device": str(device),
-    }
-    log0("[gptvec] " + json.dumps(summary, indent=2, sort_keys=True))
+    if master_process:
+        os.makedirs(Path(args.save_checkpoint).parent, exist_ok=True)
+        ckpt = {
+            "model_state": base_model.state_dict(),
+            "args": {k: getattr(args, k) for k in dir(args) if not k.startswith("_") and not callable(getattr(args, k))},
+            "vec_path": args.vec_path,
+            "vec_dim": vec_dim,
+            "train_seconds": elapsed,
+        }
+        torch.save(ckpt, args.save_checkpoint)
+        summary = {
+            "checkpoint": args.save_checkpoint,
+            "vec_path": args.vec_path,
+            "iterations": args.iterations,
+            "train_seconds": float(elapsed),
+            "device": str(device),
+        }
+        log0("[gptvec] " + json.dumps(summary, indent=2, sort_keys=True))
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
