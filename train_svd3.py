@@ -503,10 +503,15 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
+    #half = x.size(-1) // 2
+    #x1, x2 = x[..., :half], x[..., half:]
+    #return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x0 = x[..., 0]
+    x1 = x[..., 1]
+    y0 = x0 * cos - x1 * sin
+    y1 = x0 * sin + x1 * cos
+    return torch.stack((y0, y1), dim=-1).flatten(-2)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -550,7 +555,7 @@ class CausalSelfAttention(nn.Module):
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
