@@ -516,8 +516,10 @@ class FactorizedLinear(nn.Module):
         self.a = nn.Parameter(torch.empty(out_features, self.rank))
         self.b = nn.Parameter(torch.empty(self.rank, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
+#        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
+#        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
+        nn.init.normal_(self.b, mean=0.0, std=1.0 / math.sqrt(in_features))
+        nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(rank))
 
     def set_from_dense_weight(self, weight: Tensor, args: Hyperparameters, niter: int | None = None, balanced: bool = True) -> float:
         a, b, residual = truncated_svd_factors(weight, self.rank, args, niter=niter, balanced=balanced)
