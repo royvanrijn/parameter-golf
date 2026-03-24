@@ -46,11 +46,16 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 4))
-    dropout = float(os.environ.get("DROPOUT", 0.0))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
 
     vec_path = os.environ.get("VEC_PATH", "./vec_model.pkl")
     use_vec_input = bool(int(os.environ.get("USE_VEC_INPUT", "1")))
@@ -67,11 +72,134 @@ class Hyperparameters:
     save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "./gptvec_checkpoint.pt")
 
 
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        self._zero_init = False
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight.to(dtype=x.dtype), self.bias.to(dtype=x.dtype) if self.bias is not None else None)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), self.weight.to(dtype=x.dtype), self.eps)
+
+
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    y = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    return y.flatten(-2)
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("RoPE dim must be even")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seqlen: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        t = torch.arange(seqlen, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device=device))
+        cos = freqs.cos().to(dtype=dtype)[None, None, :, :]
+        sin = freqs.sin().to(dtype=dtype)[None, None, :, :]
+        return cos, sin
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
+
+
+class Block(nn.Module):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
 class GPTVecLM(nn.Module):
     def __init__(self, args: Hyperparameters, vec_table: Tensor | None):
         super().__init__()
         self.max_seq_len = args.train_seq_len
 
+        if args.logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {args.logit_softcap}")
+        self.tie_embeddings = args.tie_embeddings
+        self.tied_embed_init_std = args.tied_embed_init_std
+        self.logit_softcap = args.logit_softcap
         self.token_embedding = nn.Embedding(args.vocab_size, args.model_dim)
         self.use_vec_input = bool(args.use_vec_input and vec_table is not None)
         self.use_hybrid_embed = bool(args.use_hybrid_embed)
@@ -86,8 +214,8 @@ class GPTVecLM(nn.Module):
             vec_dim = int(vec_table.shape[1])
             proj_in = args.vec_proj_dim if args.vec_proj_dim > 0 else vec_dim
             self.vec_preproj = nn.Identity() if proj_in == vec_dim else nn.Linear(vec_dim, proj_in)
-            self.vec_proj = nn.Linear(proj_in, args.model_dim)
-            self.vec_head = nn.Linear(args.model_dim, vec_dim) if args.aux_vec_loss_weight > 0 else None
+            self.vec_proj = CastedLinear(proj_in, args.model_dim, bias=False)
+            self.vec_head = CastedLinear(args.model_dim, vec_dim, bias=False) if args.aux_vec_loss_weight > 0 else None
         else:
             self.vec_table = None
             self.vec_embedding = None
@@ -95,20 +223,28 @@ class GPTVecLM(nn.Module):
             self.vec_proj = None
             self.vec_head = None
 
-        self.pos_emb = nn.Parameter(torch.zeros(1, args.train_seq_len, args.model_dim))
-        ff_dim = args.model_dim * args.mlp_mult
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=args.model_dim,
-            nhead=args.num_heads,
-            dim_feedforward=ff_dim,
-            dropout=args.dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.num_encoder_layers = args.num_layers // 2
+        self.num_decoder_layers = args.num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, args.model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList(
+            [
+                Block(args.model_dim, args.num_heads, args.num_kv_heads, args.mlp_mult, args.rope_base, args.qk_gain_init)
+                for _ in range(args.num_layers)
+            ]
         )
-        self.backbone = nn.TransformerEncoder(enc_layer, num_layers=args.num_layers)
-        self.norm = nn.LayerNorm(args.model_dim)
-        self.lm_head = nn.Linear(args.model_dim, args.vocab_size, bias=False)
+        self.final_norm = RMSNorm(args.model_dim)
+        self.lm_head = None if args.tie_embeddings else CastedLinear(args.model_dim, args.vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=self.tied_embed_init_std)
+        for module in self.modules():
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
 
     def lookup_vec(self, tokens: Tensor) -> Tensor:
         if self.vec_embedding is not None:
@@ -128,11 +264,24 @@ class GPTVecLM(nn.Module):
             vec_h = self.vec_proj(self.vec_preproj(self.lookup_vec(x_tok)))
             h = h + vec_h if self.use_hybrid_embed else vec_h
 
-        h = h + self.pos_emb[:, :t, :]
-        mask = torch.triu(torch.ones(t, t, device=x_tok.device, dtype=torch.bool), diagonal=1)
-        h = self.backbone(h, mask=mask)
-        h = self.norm(h)
-        logits = self.lm_head(h)
+        h = F.rms_norm(h, (h.size(-1),))
+        h0 = h
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            h = self.blocks[i](h, h0)
+            skips.append(h)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                h = h + self.skip_weights[i].to(dtype=h.dtype)[None, None, :] * skips.pop()
+            h = self.blocks[self.num_encoder_layers + i](h, h0)
+        h = self.final_norm(h)
+        if self.tie_embeddings:
+            logits_proj = F.linear(h, self.token_embedding.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(h)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         vec_pred = self.vec_head(h) if self.vec_head is not None else None
         return logits, vec_pred
 
@@ -347,6 +496,8 @@ def main() -> None:
     model.train()
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
@@ -355,6 +506,8 @@ def main() -> None:
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
 
         if should_validate:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
@@ -369,6 +522,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
