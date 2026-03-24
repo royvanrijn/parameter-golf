@@ -443,16 +443,19 @@ class FactorizedLinear(nn.Module):
         self.a = nn.Parameter(torch.empty(out_features, self.rank))
         self.b = nn.Parameter(torch.empty(self.rank, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-#        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
-#        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
-        scale = (1.0 / (rank * in_features)) ** 0.25
 
-        nn.init.normal_(self.a, mean=0.0, std=scale)
-        nn.init.normal_(self.b, mean=0.0, std=scale)
+        # Balanced / layer-scaled init
+        std_a = init_scale_mul / math.sqrt(self.rank)
+        scale_b = init_scale_mul / math.sqrt(in_features)
 
-#        nn.init.orthogonal_(self.b)   # or self.B depending on naming
-#        self.b.mul_(1.0 / math.sqrt(in_features))
-#        nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(rank))
+        with torch.no_grad():
+            if orthogonal_b:
+                nn.init.orthogonal_(self.b)
+                self.b.mul_(scale_b)
+            else:
+                nn.init.normal_(self.b, mean=0.0, std=scale_b)
+
+            nn.init.normal_(self.a, mean=0.0, std=std_a)
 
     def forward(self, x: Tensor) -> Tensor:
         y = F.linear(x, self.b, None)
@@ -729,17 +732,34 @@ def set_module_by_name(root: nn.Module, name: str, module: nn.Module) -> None:
 @torch.no_grad()
 def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int, float]:
     converted = 0
+
     for name, dense, rank in iter_named_svd_linears(model, args):
+        init_scale_mul = 1.0
+
+        if ".mlp.fc" in name:
+            init_scale_mul = 1.00
+        elif ".mlp.proj" in name:
+            init_scale_mul = 0.70
+        elif ".attn.proj" in name:
+            init_scale_mul = 0.60
+        elif ".attn.c_qkv" in name:
+            init_scale_mul = 0.85
+
         fact = FactorizedLinear(
             in_features=dense.in_features,
             out_features=dense.out_features,
             rank=rank,
             bias=dense.bias is not None,
+            init_scale_mul=init_scale_mul,
+            orthogonal_b=True,
         ).to(device=dense.weight.device, dtype=dense.weight.dtype)
+
         if dense.bias is not None and fact.bias is not None:
             fact.bias.data.copy_(dense.bias.detach().float())
+
         set_module_by_name(model, name, fact)
         converted += 1
+
     return converted
 
 
