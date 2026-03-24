@@ -92,7 +92,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    compile_model = True
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
     # Factorized trainer: we initialize factorized layers once at startup.
     svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
@@ -931,32 +930,38 @@ def main() -> None:
     converted, avg_target_std = convert_model_to_factorized(base_model, args)
     compiled_model: nn.Module = (
         torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
-        if args.compile_model
-        else base_model
     )
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     def build_optimizers() -> tuple[list[torch.optim.Optimizer], Muon]:
         block_named_params = list(base_model.blocks.named_parameters())
-        matrix_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        scalar_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
+
+        factor_params = []
+        matrix_params = []
+        scalar_params = []
+
+        for name, p in block_named_params:
+            if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+                scalar_params.append(p)
+            elif name.endswith(".a") or name.endswith(".b"):
+                factor_params.append(p)
+            elif p.ndim == 2:
+                matrix_params.append(p)
+            else:
+                scalar_params.append(p)
+
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
+
         token_lr_local = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+
         optimizer_tok_local = torch.optim.Adam(
             [{"params": [base_model.tok_emb.weight], "lr": token_lr_local, "base_lr": token_lr_local}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
+
         optimizer_muon_local = Muon(
             matrix_params,
             lr=args.matrix_lr,
@@ -965,13 +970,28 @@ def main() -> None:
         )
         for group in optimizer_muon_local.param_groups:
             group["base_lr"] = args.matrix_lr
+
+        optimizer_factor_local = torch.optim.Adam(
+            [{"params": factor_params, "lr": args.matrix_lr * 0.5, "base_lr": args.matrix_lr * 0.5}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+
         optimizer_scalar_local = torch.optim.Adam(
             [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
-        opts: list[torch.optim.Optimizer] = [optimizer_tok_local, optimizer_muon_local, optimizer_scalar_local]
+
+        opts: list[torch.optim.Optimizer] = [
+            optimizer_tok_local,
+            optimizer_muon_local,
+            optimizer_factor_local,
+            optimizer_scalar_local,
+        ]
+
         if base_model.lm_head is not None:
             optimizer_head = torch.optim.Adam(
                 [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -980,6 +1000,7 @@ def main() -> None:
                 fused=True,
             )
             opts.insert(1, optimizer_head)
+
         return opts, optimizer_muon_local
 
     optimizers, optimizer_muon = build_optimizers()
@@ -1009,7 +1030,7 @@ def main() -> None:
         f"method={args.svd_method} power_iters={args.svd_power_iters} init_power_iters={args.svd_init_power_iters} "
         f"oversample={args.svd_oversample} "
     )
-    log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")
+    log0(f"compile_fullgraph:{args.compile_fullgraph}")
     log0(f"factorized_init converted_layers:{converted} avg_dense_weight_std:{avg_target_std:.4f}")
     log0(f"seed:{args.seed}")
 
@@ -1045,8 +1066,8 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        zero_grad_all()
         for warmup_step in range(args.warmup_steps):
-            zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -1082,6 +1103,7 @@ def main() -> None:
     first_svd_start = 300
     STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
 
+    zero_grad_all()
     for step in range(args.iterations + 1):
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
