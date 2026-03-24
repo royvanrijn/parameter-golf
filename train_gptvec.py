@@ -10,6 +10,7 @@ This script now mirrors `train_gpt.py` conventions for:
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import json
 import math
@@ -27,6 +28,15 @@ from torch import Tensor, nn
 
 from vec_model import get_vec_table, load_vec_artifact
 
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+    ).split(",")
+    if pattern
+)
+
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -41,6 +51,8 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -64,12 +76,74 @@ class Hyperparameters:
     vec_proj_dim = int(os.environ.get("VEC_PROJ_DIM", 16))
     aux_vec_loss_weight = float(os.environ.get("AUX_VEC_LOSS_WEIGHT", 0.0))
 
-    lr = float(os.environ.get("LR", 3e-4))
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.01))
+    embed_lr = float(os.environ.get("EMBED_LR", 0.6))
+    head_lr = float(os.environ.get("HEAD_LR", 0.008))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    beta1 = float(os.environ.get("BETA1", 0.9))
+    beta2 = float(os.environ.get("BETA2", 0.95))
+    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
     device = os.environ.get("DEVICE", "cuda")
     save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "./gptvec_checkpoint.pt")
+
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
+    if transposed:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    return X.T if transposed else X
+
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+        super().__init__(
+            params,
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
+            for p in params:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                p.add_(g.to(dtype=p.dtype), alpha=-lr)
+        return loss
 
 
 class CastedLinear(nn.Linear):
@@ -434,12 +508,15 @@ def eval_val(
 
 
 def main() -> None:
+    global zeropower_via_newtonschulz5
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
+    if device.type == "cuda":
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{args.run_id}.txt"
@@ -476,14 +553,93 @@ def main() -> None:
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
 
-    model = GPTVecLM(args, vec_table_t).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    base_model = GPTVecLM(args, vec_table_t).to(device)
+    if device.type == "cuda":
+        compiled_base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_base_model = base_model
+    model: nn.Module = compiled_base_model
 
-    n_params = sum(p.numel() for p in model.parameters())
+    matrix_params: list[Tensor] = []
+    scalar_params: list[Tensor] = []
+    for name, p in base_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name == "token_embedding.weight":
+            continue
+        if name == "lm_head.weight":
+            continue
+        if name == "vec_embedding.weight":
+            continue
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
+
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_tok = torch.optim.Adam(
+        [{"params": [base_model.token_embedding.weight], "lr": token_lr, "base_lr": token_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=(device.type == "cuda"),
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
+
+    if getattr(base_model, "vec_embedding", None) is not None:
+        optimizer_vec = torch.optim.Adam(
+            [{"params": [base_model.vec_embedding.weight], "lr": args.embed_lr, "base_lr": args.embed_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=(device.type == "cuda"),
+        )
+        optimizers.append(optimizer_vec)
+
+    if matrix_params:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+        optimizers.append(optimizer_muon)
+    else:
+        optimizer_muon = None
+
+    if scalar_params:
+        optimizer_scalar = torch.optim.Adam(
+            [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=(device.type == "cuda"),
+        )
+        optimizers.append(optimizer_scalar)
+
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=(device.type == "cuda"),
+        )
+        optimizers.insert(1, optimizer_head)
+
+    def zero_grad_all() -> None:
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
+
+    n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
-        f"iterations:{args.iterations} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"vec_path:{args.vec_path} use_vec_input:{args.use_vec_input} use_hybrid_embed:{args.use_hybrid_embed} "
@@ -492,6 +648,46 @@ def main() -> None:
     log0(f"seed:{args.seed}")
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def lr_mul(step: int, elapsed_ms: float) -> float:
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            if warmdown_start <= step < args.iterations:
+                return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+            return 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    if args.warmup_steps > 0:
+        initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+        initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
+        model.train()
+        for warmup_step in range(args.warmup_steps):
+            zero_grad_all()
+            in_tok, tgt_tok = sample_batch(train_tokens, args.train_batch_tokens, args.train_seq_len, device=device)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits, vec_pred = model(in_tok)
+                warmup_ce = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
+                warmup_aux = torch.zeros((), device=device)
+                if args.aux_vec_loss_weight > 0:
+                    if vec_pred is None or vec_table_t is None:
+                        raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
+                    warmup_aux = F.mse_loss(vec_pred, vec_table_t[tgt_tok])
+                warmup_loss = warmup_ce + args.aux_vec_loss_weight * warmup_aux
+            warmup_loss.backward()
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
+            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        base_model.load_state_dict(initial_model_state, strict=True)
+        for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
+            opt.load_state_dict(state)
+        zero_grad_all()
 
     model.train()
     training_time_ms = 0.0
@@ -534,6 +730,17 @@ def main() -> None:
                 )
             break
 
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+        if optimizer_muon is not None:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+
         in_tok, tgt_tok = sample_batch(train_tokens, args.train_batch_tokens, args.train_seq_len, device=device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             logits, vec_pred = model(in_tok)
@@ -548,11 +755,13 @@ def main() -> None:
 
             loss = ce_loss + args.aux_vec_loss_weight * aux_loss
 
-        optimizer.zero_grad(set_to_none=True)
+        zero_grad_all()
         loss.backward()
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-        optimizer.step()
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+        zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -571,7 +780,7 @@ def main() -> None:
 
     os.makedirs(Path(args.save_checkpoint).parent, exist_ok=True)
     ckpt = {
-        "model_state": model.state_dict(),
+        "model_state": base_model.state_dict(),
         "args": {k: getattr(args, k) for k in dir(args) if not k.startswith("_") and not callable(getattr(args, k))},
         "vec_path": args.vec_path,
         "vec_dim": vec_dim,
