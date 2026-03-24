@@ -435,13 +435,7 @@ class CastedLinear(nn.Linear):
 
 
 class FactorizedLinear(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        rank: int,
-        bias: bool = False,
-    ):
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -449,6 +443,12 @@ class FactorizedLinear(nn.Module):
         self.a = nn.Parameter(torch.empty(out_features, self.rank))
         self.b = nn.Parameter(torch.empty(self.rank, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+#        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
+#        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
+#        scale = (1.0 / (rank * in_features)) ** 0.25
+#
+#        nn.init.normal_(self.a, mean=0.0, std=scale)
+#        nn.init.normal_(self.b, mean=0.0, std=scale)
 
         nn.init.orthogonal_(self.b)   # or self.B depending on naming
         self.b.mul_(1.0 / math.sqrt(in_features))
@@ -511,6 +511,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(
