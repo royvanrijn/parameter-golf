@@ -912,6 +912,12 @@ def main() -> None:
                     window=max(args.vec_train_window, 1),
                     device=torch.device("cpu"),             # keep vec training off GPU
                 )
+
+                vec_path = Path(args.vec_path)
+                vec_path.parent.mkdir(parents=True, exist_ok=True)
+                with vec_path.open("wb") as f:
+                    pickle.dump(payload, f)
+
                 log0("[vec] training done")
 
             if distributed:
