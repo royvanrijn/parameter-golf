@@ -898,45 +898,50 @@ def main() -> None:
             torch.cuda.synchronize()
         vec_setup_t0 = time.perf_counter()
 
-        payload = None
-        vec_table_np = None
-
         if args.inline_vec_train:
+            # Rank 0 trains vec; others receive it by broadcast.
             if master_process:
                 log0(f"[vec] training inline vec model for {args.vec_train_tokens} tokens")
                 payload = train_inline_vec_model(
                     pattern=args.train_files,
                     vocab_size=args.vocab_size,
                     max_tokens=args.vec_train_tokens,
-                    dim=max(args.vec_dim, 1),               # use a real VEC_DIM arg
+                    dim=max(args.vec_dim, 1),
                     window=max(args.vec_train_window, 1),
-                    device=torch.device("cpu"),             # keep vec training off GPU
+                    device=torch.device("cpu"),   # keep vec training off GPU
                 )
-
-                vec_path = Path(args.vec_path)
-                vec_path.parent.mkdir(parents=True, exist_ok=True)
-                with vec_path.open("wb") as f:
-                    pickle.dump(payload, f)
-
+                vec_table_np = get_vec_table(payload)
+                if vec_table_np.shape[0] != args.vocab_size:
+                    raise RuntimeError(
+                        f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, "
+                        f"args.vocab_size={args.vocab_size}"
+                    )
+                vec_shape = torch.tensor(vec_table_np.shape, dtype=torch.int64, device=device)
+                vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
                 log0("[vec] training done")
+            else:
+                vec_shape = torch.zeros(2, dtype=torch.int64, device=device)
+                vec_table_t = None
 
             if distributed:
-                dist.barrier()
+                dist.broadcast(vec_shape, src=0)
+                rows, cols = int(vec_shape[0].item()), int(vec_shape[1].item())
+                if not master_process:
+                    vec_table_t = torch.empty((rows, cols), dtype=torch.float32, device=device)
+                dist.broadcast(vec_table_t, src=0)
 
-            if not master_process:
-                payload = load_vec_artifact(args.vec_path)
+            vec_dim = int(vec_table_t.shape[1])
 
         else:
             payload = load_vec_artifact(args.vec_path)
-
-        vec_table_np = get_vec_table(payload)
-        if vec_table_np.shape[0] != args.vocab_size:
-            raise RuntimeError(
-                f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, args.vocab_size={args.vocab_size}"
-            )
-
-        vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
-        vec_dim = int(vec_table_t.shape[1])
+            vec_table_np = get_vec_table(payload)
+            if vec_table_np.shape[0] != args.vocab_size:
+                raise RuntimeError(
+                    f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, "
+                    f"args.vocab_size={args.vocab_size}"
+                )
+            vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
+            vec_dim = int(vec_table_t.shape[1])
 
         if device.type == "cuda":
             torch.cuda.synchronize()
