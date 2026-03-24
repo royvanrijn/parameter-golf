@@ -109,8 +109,7 @@ class Hyperparameters:
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
     svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
-    # Use separate iters for transition SVD (often can be cheaper than phase-1 refresh).
-    svd_power_iters_phase2 = int(os.environ.get("SVD_POWER_ITERS_PHASE2", 0))
+    svd_init_power_iters = int(os.environ.get("SVD_INIT_POWER_ITERS", os.environ.get("SVD_POWER_ITERS_PHASE2", 0)))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
 
 # -----------------------------
@@ -172,12 +171,9 @@ def truncated_svd_factors(
     max_rank = min(out_dim, in_dim)
     rank = max(1, min(int(rank), max_rank))
     if rank >= max_rank:
-        if out_dim <= in_dim:
-            a = torch.eye(out_dim, device=arr.device, dtype=arr.dtype)
-            b = arr
-        else:
-            a = arr
-            b = torch.eye(in_dim, device=arr.device, dtype=arr.dtype)
+        eye = torch.eye(max_rank, device=arr.device, dtype=arr.dtype)
+        a = arr @ eye
+        b = eye.T
         return a, b, 0.0
 
     if args.svd_method == "full":
@@ -530,6 +526,13 @@ class FactorizedLinear(nn.Module):
         self.b.data.copy_(b.to(self.b.dtype).to(self.b.device))
         return residual
 
+    def init_from_dense_variance(self, weight: Tensor) -> None:
+        target_std = float(weight.detach().float().std())
+        target_std = max(target_std, 1e-8)
+        factor_std = math.sqrt(target_std) / (self.rank ** 0.25)
+        nn.init.normal_(self.a, mean=0.0, std=factor_std)
+        nn.init.normal_(self.b, mean=0.0, std=factor_std)
+
     def forward(self, x: Tensor) -> Tensor:
         y = F.linear(x, self.b, None)
         bias = self.bias
@@ -789,9 +792,9 @@ def set_module_by_name(root: nn.Module, name: str, module: nn.Module) -> None:
 
 
 @torch.no_grad()
-def transition_to_factorized(model: GPT, args: Hyperparameters, step_1idx: int) -> tuple[int, float]:
+def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int, float]:
     converted = 0
-    residual_sum = 0.0
+    avg_target_std_sum = 0.0
     for name, dense, rank in iter_named_svd_linears(model, args):
         fact = FactorizedLinear(
             in_features=dense.in_features,
@@ -799,18 +802,14 @@ def transition_to_factorized(model: GPT, args: Hyperparameters, step_1idx: int) 
             rank=rank,
             bias=dense.bias is not None,
         ).to(device=dense.weight.device, dtype=dense.weight.dtype)
-        residual = fact.set_from_dense_weight(
-            dense.weight,
-            args=args,
-            niter=args.svd_power_iters_phase2,
-            balanced=args.svd_balance_factors,
-        )
+        target_std = float(dense.weight.detach().float().std())
+        fact.init_from_dense_variance(dense.weight)
         if dense.bias is not None and fact.bias is not None:
             fact.bias.data.copy_(dense.bias.detach().float())
         set_module_by_name(model, name, fact)
         converted += 1
-        residual_sum += residual
-    return converted, residual_sum / max(converted, 1)
+        avg_target_std_sum += target_std
+    return converted, avg_target_std_sum / max(converted, 1)
 
 
 # -----------------------------
@@ -929,7 +928,7 @@ def main() -> None:
 
     # Simplified train_svd3: convert to factorized weights before wrapping with DDP so
     # distributed reducers/parameter buckets are built from the final trainable params.
-    converted, avg_residual = transition_to_factorized(base_model, args, step_1idx=0)
+    converted, avg_target_std = convert_model_to_factorized(base_model, args)
     compiled_model: nn.Module = (
         torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph)
         if args.compile_model
@@ -1007,11 +1006,11 @@ def main() -> None:
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
         f"use_qkv={args.svd_use_qkv} rank_qk={args.svd_rank_qk} rank_v={args.svd_rank_v} "
-        f"method={args.svd_method} power_iters={args.svd_power_iters} power_iters_phase2={args.svd_power_iters_phase2} "
+        f"method={args.svd_method} power_iters={args.svd_power_iters} init_power_iters={args.svd_init_power_iters} "
         f"oversample={args.svd_oversample} "
     )
     log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")
-    log0(f"svd3_transition step:0 converted_layers:{converted} avg_residual:{avg_residual:.4f}")
+    log0(f"factorized_init converted_layers:{converted} avg_dense_weight_std:{avg_target_std:.4f}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1149,7 +1148,7 @@ def main() -> None:
 
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # Capture a stable per-step time estimate before phase-2 SVD overhead starts.
+        # Capture a stable per-step time estimate during early steady-state training.
         if stable_step_ms is None and step == STABLE_STEP_CAPTURE:
             stable_step_ms = approx_training_time_ms / step
             log0(f"stable_step_ms captured: {stable_step_ms:.2f}ms at step {step}", console=False)
