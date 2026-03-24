@@ -52,11 +52,11 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
     dropout = float(os.environ.get("DROPOUT", 0.0))
 
-    vec_path = os.environ.get("VEC_PATH", "./artifacts/gptvec_model.pkl")
+    vec_path = os.environ.get("VEC_PATH", "./vec_model.pkl")
     use_vec_input = bool(int(os.environ.get("USE_VEC_INPUT", "1")))
     use_hybrid_embed = bool(int(os.environ.get("USE_HYBRID_EMBED", "1")))
     freeze_vec = bool(int(os.environ.get("FREEZE_VEC", "1")))
-    vec_proj_dim = int(os.environ.get("VEC_PROJ_DIM", 256))
+    vec_proj_dim = int(os.environ.get("VEC_PROJ_DIM", 16))
     aux_vec_loss_weight = float(os.environ.get("AUX_VEC_LOSS_WEIGHT", 0.0))
 
     lr = float(os.environ.get("LR", 3e-4))
@@ -64,7 +64,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
     device = os.environ.get("DEVICE", "cuda")
-    save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "./artifacts/gptvec_checkpoint.pt")
+    save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "./gptvec_checkpoint.pt")
 
 
 class GPTVecLM(nn.Module):
@@ -121,8 +121,6 @@ class GPTVecLM(nn.Module):
         _, t = x_tok.shape
         if t > self.max_seq_len:
             raise ValueError(f"Sequence length {t} exceeds max_seq_len={self.max_seq_len}")
-
-        x_tok = x_tok.long()
 
         tok_h = self.token_embedding(x_tok)
         h = tok_h
@@ -223,9 +221,14 @@ def sample_batch(tokens: Tensor, train_batch_tokens: int, seq_len: int, device: 
     max_start = tokens.numel() - seq_len - 1
     if max_start <= 0:
         raise RuntimeError("Token stream too short for configured TRAIN_SEQ_LEN")
-    ix = torch.randint(0, max_start, (batch_size,), device=device)
-    windows = torch.stack([tokens[i : i + seq_len + 1] for i in ix.tolist()], dim=0)
-    return windows[:, :-1], windows[:, 1:]
+
+    ix = torch.randint(0, max_start, (batch_size,), device=tokens.device)
+    offsets = torch.arange(seq_len + 1, device=tokens.device)
+    windows = tokens[ix[:, None] + offsets[None, :]]
+
+    x = windows[:, :-1].to(device=device, dtype=torch.long, non_blocking=True)
+    y = windows[:, 1:].to(device=device, dtype=torch.long, non_blocking=True)
+    return x, y
 
 
 def eval_val(
@@ -306,7 +309,7 @@ def main() -> None:
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}")
 
-    train_tokens = load_tokens(args.train_files, args.train_seq_len).to(device)
+    train_tokens = load_tokens(args.train_files, args.train_seq_len)
     val_tokens = load_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size, device)
 
