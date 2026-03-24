@@ -520,8 +520,8 @@ class FactorizedLinear(nn.Module):
 #        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
         scale = (1.0 / (rank * in_features)) ** 0.25
 
-        nn.init.normal_(self.A, mean=0.0, std=scale)
-        nn.init.normal_(self.B, mean=0.0, std=scale)
+        nn.init.normal_(self.a, mean=0.0, std=scale)
+        nn.init.normal_(self.b, mean=0.0, std=scale)
 
     def set_from_dense_weight(self, weight: Tensor, args: Hyperparameters, niter: int | None = None, balanced: bool = True) -> float:
         a, b, residual = truncated_svd_factors(weight, self.rank, args, niter=niter, balanced=balanced)
