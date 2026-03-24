@@ -95,7 +95,6 @@ class Hyperparameters:
     compile_model = True
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
     # Factorized trainer: we initialize factorized layers once at startup.
-    svd_balance_factors = bool(int(os.environ.get("SVD_BALANCE_FACTORS", "1")))
     svd_rank_fc = int(os.environ.get("SVD_RANK_FC", 64))
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
@@ -104,12 +103,10 @@ class Hyperparameters:
     # This frees artifact bytes (they become low-rank factors instead of full int8 matrices)
     # which can be reinvested in higher MLP ranks.
     svd_use_qkv = bool(int(os.environ.get("SVD_USE_QKV", "1")))
-    svd_rank_qk = int(os.environ.get("SVD_RANK_QK", 128))
-    svd_rank_v = int(os.environ.get("SVD_RANK_V", 128))
+    svd_rank_qkv = int(os.environ.get("SVD_RANK_QKV", os.environ.get("SVD_RANK_QK", "128")))
     svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
     svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
-    svd_init_power_iters = int(os.environ.get("SVD_INIT_POWER_ITERS", os.environ.get("SVD_POWER_ITERS_PHASE2", 0)))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
 
 # -----------------------------
@@ -171,9 +168,12 @@ def truncated_svd_factors(
     max_rank = min(out_dim, in_dim)
     rank = max(1, min(int(rank), max_rank))
     if rank >= max_rank:
-        eye = torch.eye(max_rank, device=arr.device, dtype=arr.dtype)
-        a = arr @ eye
-        b = eye.T
+        if out_dim <= in_dim:
+            a = torch.eye(out_dim, device=arr.device, dtype=arr.dtype)
+            b = arr
+        else:
+            a = arr
+            b = torch.eye(in_dim, device=arr.device, dtype=arr.dtype)
         return a, b, 0.0
 
     if args.svd_method == "full":
@@ -534,12 +534,19 @@ class FactorizedLinear(nn.Module):
         nn.init.normal_(self.b, mean=0.0, std=factor_std)
 
     def forward(self, x: Tensor) -> Tensor:
-        y = F.linear(x, self.b, None)
+        orig_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        y2 = F.linear(x2, self.b, None)
         bias = self.bias
-        if bias is not None and bias.dtype != x.dtype:
-            bias = bias.to(x.dtype)
-        return F.linear(y, self.a, bias)
-
+        if bias is not None and bias.dtype != x2.dtype:
+            bias = bias.to(x2.dtype)
+        z2 = F.linear(y2, self.a, bias)
+        return z2.view(*orig_shape, self.out_features)
+#        y = F.linear(x, self.b, None)
+#        bias = self.bias
+#        if bias is not None and bias.dtype != x.dtype:
+#            bias = bias.to(x.dtype)
+#        return F.linear(y, self.a, bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
@@ -594,25 +601,35 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("model_dim must be divisible by num_heads")
         if num_heads % num_kv_heads != 0:
             raise ValueError("num_heads must be divisible by num_kv_heads")
+
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+
+        self.dim = dim
+        self.kv_dim = self.num_kv_heads * self.head_dim
+        self.qkv_out_dim = dim + 2 * self.kv_dim
+
+        # packed QKV projection: [q | k | v]
+        self.c_qkv = CastedLinear(dim, self.qkv_out_dim, bias=False)
+
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
+
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+
+        qkv = self.c_qkv(x)
+        q, k, v = torch.split(qkv, [self.dim, self.kv_dim, self.kv_dim], dim=-1)
+
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous()
 
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -622,14 +639,10 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-
         y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
             attn_mask=None,
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
@@ -637,7 +650,6 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
-
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
@@ -768,9 +780,7 @@ def iter_named_svd_linears(model: GPT, args: Hyperparameters) -> list[tuple[str,
         if args.svd_use_attn_proj:
             out.append((f"blocks.{layer_idx}.attn.proj", block.attn.proj, args.svd_rank_attn_proj))
         if args.svd_use_qkv:
-            out.append((f"blocks.{layer_idx}.attn.c_q", block.attn.c_q, args.svd_rank_qk))
-            out.append((f"blocks.{layer_idx}.attn.c_k", block.attn.c_k, args.svd_rank_qk))
-            out.append((f"blocks.{layer_idx}.attn.c_v", block.attn.c_v, args.svd_rank_v))
+            out.append((f"blocks.{layer_idx}.attn.c_qkv", block.attn.c_qkv, args.svd_rank_qkv))
     return out
 
 
@@ -1002,11 +1012,10 @@ def main() -> None:
     )
     log0(
         f"svd3_training: simplified_factorized_only=True transition_step=0 "
-        f"balance_factors={args.svd_balance_factors} "
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
-        f"use_qkv={args.svd_use_qkv} rank_qk={args.svd_rank_qk} rank_v={args.svd_rank_v} "
-        f"method={args.svd_method} power_iters={args.svd_power_iters} init_power_iters={args.svd_init_power_iters} "
+        f"use_qkv={args.svd_use_qkv} rank_qkv={args.svd_rank_qkv} "
+        f"method={args.svd_method} power_iters={args.svd_power_iters} "
         f"oversample={args.svd_oversample} "
     )
     log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")

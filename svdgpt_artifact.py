@@ -36,6 +36,9 @@ def svd_rank_for_name(name: str, args) -> int:
         if name.endswith("attn.c_v.weight"):
             return int(args.svd_rank_v)
 
+    if ".attn.c_qkv." in name:
+        return args.svd_rank_qkv
+
     return 0
 
 
