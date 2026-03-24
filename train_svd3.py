@@ -466,14 +466,19 @@ class FactorizedLinear(nn.Module):
             nn.init.normal_(self.a, mean=0.0, std=std_a)
 
     def forward(self, x: Tensor) -> Tensor:
-        orig_shape = x.shape[:-1]
-        x2 = x.reshape(-1, x.shape[-1])
-        y2 = F.linear(x2, self.b, None)
+        y = F.linear(x, self.b, None)
         bias = self.bias
-        if bias is not None and bias.dtype != x2.dtype:
-            bias = bias.to(x2.dtype)
-        z2 = F.linear(y2, self.a, bias)
-        return z2.view(*orig_shape, self.out_features)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
+        return F.linear(y, self.a, bias)
+#       orig_shape = x.shape[:-1]
+#        x2 = x.reshape(-1, x.shape[-1])
+#        y2 = F.linear(x2, self.b, None)
+#        bias = self.bias
+#        if bias is not None and bias.dtype != x2.dtype:
+#            bias = bias.to(x2.dtype)
+#        z2 = F.linear(y2, self.a, bias)
+#        return z2.view(*orig_shape, self.out_features)
 
 KEEP_FP32_NAME_PATTERNS = (
     "resid_mix",
@@ -514,10 +519,12 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
+    x = x.reshape(*x.shape[:-1], -1, 2)
+    x0 = x[..., 0]
+    x1 = x[..., 1]
+    y0 = x0 * cos - x1 * sin
+    y1 = x0 * sin + x1 * cos
+    return torch.stack((y0, y1), dim=-1).flatten(-2)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
