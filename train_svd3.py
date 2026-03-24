@@ -144,9 +144,12 @@ def truncated_svd_factors(
     max_rank = min(out_dim, in_dim)
     rank = max(1, min(int(rank), max_rank))
     if rank >= max_rank:
-        eye = torch.eye(max_rank, device=arr.device, dtype=arr.dtype)
-        a = arr @ eye
-        b = eye.T
+        if out_dim <= in_dim:
+            a = torch.eye(out_dim, device=arr.device, dtype=arr.dtype)
+            b = arr
+        else:
+            a = arr
+            b = torch.eye(in_dim, device=arr.device, dtype=arr.dtype)
         return a, b, 0.0
 
     if args.svd_method == "full":
@@ -845,11 +848,10 @@ def main() -> None:
     )
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    def build_optimizers() -> tuple[list[torch.optim.Optimizer]]:
+    def build_optimizers() -> list[torch.optim.Optimizer]:
         block_named_params = list(base_model.blocks.named_parameters())
 
         factor_params = []
-        matrix_params = []
         scalar_params = []
 
         for name, p in block_named_params:
@@ -857,8 +859,6 @@ def main() -> None:
                 scalar_params.append(p)
             elif name.endswith(".a") or name.endswith(".b"):
                 factor_params.append(p)
-            elif p.ndim == 2:
-                matrix_params.append(p)
             else:
                 scalar_params.append(p)
 
@@ -1049,7 +1049,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
