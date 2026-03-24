@@ -12,12 +12,14 @@ from __future__ import annotations
 import argparse
 import copy
 import glob
+import io
 import json
 import math
 import os
 import random
 import time
 import uuid
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +40,19 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
+    ).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 
 class Hyperparameters:
@@ -80,6 +95,7 @@ class Hyperparameters:
 
     inline_vec_train = bool(int(os.environ.get("INLINE_VEC_TRAIN", "0")))
     vec_train_tokens = int(os.environ.get("VEC_TRAIN_TOKENS", 2_000_000))
+    vec_train_window = int(os.environ.get("VEC_TRAIN_WINDOW", 8))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -97,6 +113,7 @@ class Hyperparameters:
 
     device = os.environ.get("DEVICE", "cuda")
     save_checkpoint = os.environ.get("SAVE_CHECKPOINT", "./gptvec_checkpoint.pt")
+    export_artifact = os.environ.get("EXPORT_ARTIFACT", "./final_gptvec.int8.ptz")
 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
@@ -403,6 +420,107 @@ def parse_args() -> Hyperparameters:
     return args
 
 
+def tensor_nbytes(t: Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+
+def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return t.float().contiguous()
+    if t.dtype in {torch.float32, torch.bfloat16}:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    return t
+
+
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1) if t32.numel() else torch.empty((t32.shape[0],), dtype=torch.float32)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    return q, scale
+
+
+def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "int8_clean_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            s = s.to(dtype=torch.float32)
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            scale = float(s.item())
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
@@ -417,6 +535,22 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+
+
+def train_inline_vec_model(pattern: str, vocab_size: int, max_tokens: int, dim: int, window: int, device: torch.device) -> dict[str, object]:
+    from train_vec import build_cooc_ppmi_embeddings
+
+    stream = TokenStream(pattern)
+    tokens = stream.take(max_tokens).to(dtype=torch.int64).cpu().numpy().astype(np.int32, copy=False)
+    emb, _ = build_cooc_ppmi_embeddings(
+        tokens=tokens,
+        vocab_size=vocab_size,
+        dim=dim,
+        window=window,
+        device=device,
+        smooth=1.0,
+    )
+    return {"embeddings": emb.detach().cpu().numpy().astype(np.float32, copy=False), "vocab_size": int(vocab_size), "dim": int(dim)}
 
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
@@ -646,22 +780,19 @@ def main() -> None:
     if args.use_vec_input or args.aux_vec_loss_weight > 0:
         torch.cuda.synchronize()
         vec_setup_t0 = time.perf_counter()
-        if inline_vec_train:
-            from vec_model import train_vec_model  # or whatever entrypoint you have
-
+        if args.inline_vec_train:
             if master_process:
-                log0(f"[vec] training inline vec model for {vec_train_tokens} tokens")
-
-            payload = train_vec_model(
+                log0(f"[vec] training inline vec model for {args.vec_train_tokens} tokens")
+            payload = train_inline_vec_model(
                 pattern=args.train_files,
                 vocab_size=args.vocab_size,
-                max_tokens=vec_train_tokens,
-                dim=args.vec_proj_dim,   # or separate VEC_DIM if you want
+                max_tokens=args.vec_train_tokens,
+                dim=max(args.vec_proj_dim, 1),
+                window=max(args.vec_train_window, 1),
+                device=device,
             )
-
             if master_process:
                 log0("[vec] training done")
-
         else:
             payload = load_vec_artifact(args.vec_path)
 
@@ -680,14 +811,8 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    matrix_params = [p for name, p in block_named_params if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
+    scalar_params = [p for name, p in block_named_params if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)]
     extra_scalar_names = {"final_norm.weight", "q_gain"}
     for name, p in base_model.named_parameters():
         if not p.requires_grad:
@@ -698,6 +823,17 @@ def main() -> None:
             scalar_params.append(p)
         elif p.ndim == 2:
             matrix_params.append(p)
+    matrix_unique: dict[int, nn.Parameter] = {}
+    for p in matrix_params:
+        matrix_unique[id(p)] = p
+    scalar_unique: dict[int, nn.Parameter] = {}
+    for p in scalar_params:
+        scalar_unique[id(p)] = p
+    for pid in list(scalar_unique.keys()):
+        if pid in matrix_unique:
+            del scalar_unique[pid]
+    matrix_params = list(matrix_unique.values())
+    scalar_params = list(scalar_unique.values())
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -739,7 +875,12 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    vec_state_bytes = 0
+    for name, tensor in base_model.state_dict().items():
+        if "vec_" in name:
+            vec_state_bytes += tensor_nbytes(tensor)
     log0(f"model_params:{n_params}")
+    log0(f"vec_state_bytes:{vec_state_bytes}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
@@ -883,14 +1024,63 @@ def main() -> None:
             "train_seconds": elapsed,
         }
         torch.save(ckpt, args.save_checkpoint)
+        ckpt_bytes = os.path.getsize(args.save_checkpoint)
         summary = {
             "checkpoint": args.save_checkpoint,
+            "checkpoint_bytes": ckpt_bytes,
             "vec_path": args.vec_path,
             "iterations": args.iterations,
             "train_seconds": float(elapsed),
             "device": str(device),
         }
         log0("[gptvec] " + json.dumps(summary, indent=2, sort_keys=True))
+
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_buf = io.BytesIO()
+    torch.save(quant_obj, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_raw_bytes = len(quant_raw)
+    if master_process:
+        os.makedirs(Path(args.export_artifact).parent, exist_ok=True)
+        with open(args.export_artifact, "wb") as f:
+            f.write(quant_blob)
+        export_bytes = os.path.getsize(args.export_artifact)
+        code_bytes = len(code.encode("utf-8"))
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log0(
+            f"export_artifact:{args.export_artifact} bytes:{export_bytes} "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        )
+        log0(f"total_submission_bytes_with_code:{export_bytes + code_bytes}")
+
+    if distributed:
+        dist.barrier()
+    with open(args.export_artifact, "rb") as f:
+        quant_blob_disk = f.read()
+    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    roundtrip_state = dequantize_state_dict_int8(quant_state)
+    base_model.load_state_dict(roundtrip_state, strict=True)
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    q_val_loss, q_val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    torch.cuda.synchronize()
+    log0(
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+    )
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 
