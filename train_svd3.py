@@ -516,10 +516,7 @@ class FactorizedLinear(nn.Module):
         self.a = nn.Parameter(torch.empty(out_features, self.rank))
         self.b = nn.Parameter(torch.empty(self.rank, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-#        nn.init.kaiming_uniform_(self.a, a=math.sqrt(5))
-#        nn.init.kaiming_uniform_(self.b, a=math.sqrt(5))
-        scale = (1.0 / (rank * in_features)) ** 0.25
-
+        scale = (1.0 / (self.rank * in_features)) ** 0.25
         nn.init.normal_(self.a, mean=0.0, std=scale)
         nn.init.normal_(self.b, mean=0.0, std=scale)
 
@@ -598,6 +595,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        svd_rank_qkv: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -616,7 +614,8 @@ class CausalSelfAttention(nn.Module):
         self.qkv_out_dim = dim + 2 * self.kv_dim
 
         # packed QKV projection: [q | k | v]
-        self.c_qkv = CastedLinear(dim, self.qkv_out_dim, bias=False)
+        # self.c_qkv = CastedLinear(dim, self.qkv_out_dim, bias=False)
+        self.c_qkv = FactorizedLinear(dim, self.qkv_out_dim, svd_rank_qkv, bias=False)
 
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
@@ -677,11 +676,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        svd_rank_qkv: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, svd_rank_qkv)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -710,6 +710,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        svd_rank_qkv: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -731,6 +732,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    svd_rank_qkv,
                 )
                 for i in range(num_layers)
             ]
