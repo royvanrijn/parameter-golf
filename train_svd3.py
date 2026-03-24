@@ -880,7 +880,7 @@ def main() -> None:
         )
 
         optimizer_factor_local = torch.optim.Adam(
-            [{"params": factor_params, "lr": args.matrix_lr * 0.5, "base_lr": args.matrix_lr * 0.5}],
+            [{"params": factor_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
