@@ -453,7 +453,7 @@ class FactorizedLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         y = F.linear(x, self.b, None)
-        return F.linear(x, self.weight, self.bias)
+        return F.linear(y, self.a, self.bias)
 #       orig_shape = x.shape[:-1]
 #        x2 = x.reshape(-1, x.shape[-1])
 #        y2 = F.linear(x2, self.b, None)
