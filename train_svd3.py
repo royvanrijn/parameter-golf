@@ -938,6 +938,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        svd_rank_qkv=args.svd_rank_qkv,
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
 
