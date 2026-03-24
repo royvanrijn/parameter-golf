@@ -92,7 +92,7 @@ class Hyperparameters:
     freeze_vec = bool(int(os.environ.get("FREEZE_VEC", "1")))
     vec_proj_dim = int(os.environ.get("VEC_PROJ_DIM", 16))
     aux_vec_loss_weight = float(os.environ.get("AUX_VEC_LOSS_WEIGHT", 0.0))
-
+    vec_dim = int(os.environ.get("VEC_DIM", 16))
     inline_vec_train = bool(int(os.environ.get("INLINE_VEC_TRAIN", "0")))
     vec_train_tokens = int(os.environ.get("VEC_TRAIN_TOKENS", 2_000_000))
     vec_train_window = int(os.environ.get("VEC_TRAIN_WINDOW", 8))
@@ -912,8 +912,6 @@ def main() -> None:
                     window=max(args.vec_train_window, 1),
                     device=torch.device("cpu"),             # keep vec training off GPU
                 )
-                if args.vec_path:
-                    save_vec_artifact(payload, args.vec_path)   # implement if not present
                 log0("[vec] training done")
 
             if distributed:
