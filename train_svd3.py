@@ -100,7 +100,7 @@ class Hyperparameters:
     # This frees artifact bytes (they become low-rank factors instead of full int8 matrices)
     # which can be reinvested in higher MLP ranks.
     svd_use_qkv = bool(int(os.environ.get("SVD_USE_QKV", "1")))
-    svd_rank_qkv = int(os.environ.get("SVD_RANK_QKV", os.environ.get("SVD_RANK_QK", "128")))
+    svd_rank_qkv = int(os.environ.get("SVD_RANK_QKV", "128"))
 
 # -----------------------------
 # MUON OPTIMIZER
