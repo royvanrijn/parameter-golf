@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import numpy as np
 from collections.abc import Callable
 
-SVD_TARGET_SUFFIX_TO_RANK_ATTR = {
-    ".mlp.fc.weight": "svd_rank_fc",
-    ".mlp.proj.weight": "svd_rank_proj",
-    ".attn.proj.weight": "svd_rank_attn_proj",
-}
+import numpy as np
 
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
@@ -17,29 +12,23 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 
 def is_svd_target_name(name: str) -> bool:
-    return any(name.endswith(suffix) for suffix in SVD_TARGET_SUFFIX_TO_RANK_ATTR)
+    """Compatibility helper for older callers.
+
+    The current svd3 model is trained directly with factorized Linear layers, so the
+    export pipeline no longer needs an extra dense->SVD conversion pass.
+    """
+    return False
+
 
 
 def svd_rank_for_name(name: str, args) -> int:
-    if name.endswith("mlp.fc.weight"):
-        return int(args.svd_rank_fc)
-    if name.endswith("mlp.proj.weight"):
-        return int(args.svd_rank_proj)
-    if getattr(args, "svd_use_attn_proj", True) and name.endswith("attn.proj.weight"):
-        return int(args.svd_rank_attn_proj)
+    """Compatibility helper for older callers.
 
-    if getattr(args, "svd_use_qkv", False):
-        if name.endswith("attn.c_q.weight"):
-            return int(args.svd_rank_qk)
-        if name.endswith("attn.c_k.weight"):
-            return int(args.svd_rank_qk)
-        if name.endswith("attn.c_v.weight"):
-            return int(args.svd_rank_v)
-
-    if ".attn.c_qkv." in name:
-        return args.svd_rank_qkv
-
+    We keep the function/signature so train code does not need to change, but dense
+    SVD export is intentionally disabled for the current factorized model.
+    """
     return 0
+
 
 
 def export_np_dtype(dtype_name: str) -> np.dtype:
@@ -49,6 +38,7 @@ def export_np_dtype(dtype_name: str) -> np.dtype:
     if name == "float32":
         return np.float32
     raise ValueError(f"Unsupported SVD_EXPORT_FLOAT_DTYPE={dtype_name}")
+
 
 
 def keep_float_array(
@@ -63,6 +53,7 @@ def keep_float_array(
         passthrough_orig_dtypes[name] = str(arr.dtype)
         return np.ascontiguousarray(arr.astype(INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
     return np.ascontiguousarray(np.array(arr, copy=True))
+
 
 
 def quantize_float_array(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -80,49 +71,6 @@ def quantize_float_array(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.ascontiguousarray(q), scale
 
 
-def svd_factorize_array(arr: np.ndarray, rank: int, store_dtype: np.dtype) -> dict[str, np.ndarray | str | tuple[int, ...] | int]:
-    f32 = np.ascontiguousarray(arr.astype(np.float32, copy=False))
-    out_dim, in_dim = f32.shape
-    max_rank = min(out_dim, in_dim)
-    rank = max(1, min(int(rank), max_rank))
-    u, s, vh = np.linalg.svd(f32, full_matrices=False)
-
-    u = np.ascontiguousarray(u[:, :rank].astype(np.float32, copy=False))
-    s = np.ascontiguousarray(s[:rank].astype(store_dtype, copy=False))
-    vh = np.ascontiguousarray(vh[:rank, :].astype(np.float32, copy=False))
-    u_q, u_scale = quantize_float_array(u)
-    vh_q, vh_scale = quantize_float_array(vh)
-
-    return {
-        "shape": f32.shape,
-        "rank": rank,
-        "u_q": u_q,
-        "u_scale": u_scale,
-        "vh_q": vh_q,
-        "vh_scale": vh_scale,
-        "s": s,
-        "dtype": str(arr.dtype),
-    }
-
-
-def reconstruct_svd_factorized_array(spec: dict[str, object]) -> np.ndarray:
-    u_q = np.asarray(spec["u_q"], dtype=np.int8)
-    u_scale = np.asarray(spec["u_scale"], dtype=np.float32)
-    if u_scale.ndim > 0:
-        u = u_q.astype(np.float32) * u_scale.reshape((u_q.shape[0],) + (1,) * (u_q.ndim - 1))
-    else:
-        u = u_q.astype(np.float32) * float(u_scale)
-
-    vh_q = np.asarray(spec["vh_q"], dtype=np.int8)
-    vh_scale = np.asarray(spec["vh_scale"], dtype=np.float32)
-    if vh_scale.ndim > 0:
-        vh = vh_q.astype(np.float32) * vh_scale.reshape((vh_q.shape[0],) + (1,) * (vh_q.ndim - 1))
-    else:
-        vh = vh_q.astype(np.float32) * float(vh_scale)
-
-    s = np.asarray(spec["s"], dtype=np.float32)
-    return np.ascontiguousarray((u * s[None, :]) @ vh)
-
 
 def quantize_state_dict_int8(
     state: dict[str, np.ndarray],
@@ -131,13 +79,15 @@ def quantize_state_dict_int8(
     svd_rank_lookup: Callable[[str], int],
     svd_export_dtype: np.dtype,
 ) -> tuple[dict[str, object], dict[str, int]]:
+    del svd_rank_lookup
+    del svd_export_dtype
+
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, np.ndarray] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
-    svd_factors: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
         (
             "param_count",
@@ -146,7 +96,6 @@ def quantize_state_dict_int8(
             "num_nonfloat_tensors",
             "baseline_tensor_bytes",
             "int8_payload_bytes",
-            "svd_factor_bytes",
         ),
         0,
     )
@@ -156,22 +105,6 @@ def quantize_state_dict_int8(
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += int(arr.nbytes)
 
-        rank = int(svd_rank_lookup(name))
-        if rank > 0 and arr.ndim == 2 and np.issubdtype(arr.dtype, np.floating):
-            stats["num_float_tensors"] += 1
-            spec = svd_factorize_array(arr, rank, svd_export_dtype)
-            svd_factors[name] = spec
-            svd_bytes = (
-                spec["u_q"].nbytes
-                + spec["u_scale"].nbytes
-                + spec["vh_q"].nbytes
-                + spec["vh_scale"].nbytes
-                + spec["s"].nbytes
-            )
-            stats["svd_factor_bytes"] += int(svd_bytes)
-            stats["int8_payload_bytes"] += int(svd_bytes)
-            continue
-
         if not np.issubdtype(arr.dtype, np.floating):
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = arr
@@ -179,6 +112,7 @@ def quantize_state_dict_int8(
             continue
 
         if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            stats["num_float_tensors"] += 1
             kept = keep_float_array(name, arr, passthrough_orig_dtypes, keep_float_fp32_name_patterns)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += int(kept.nbytes)
@@ -194,12 +128,11 @@ def quantize_state_dict_int8(
         stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
 
     obj: dict[str, object] = {
-        "__quant_format__": "int8_plus_svd_v2",
+        "__quant_format__": "int8_v3",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
         "passthrough": passthrough,
-        "svd_factors": svd_factors,
     }
     if qmeta:
         obj["qmeta"] = qmeta
@@ -208,10 +141,12 @@ def quantize_state_dict_int8(
     return obj, stats
 
 
+
 def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
     qmeta = quant_obj.get("qmeta", {})
     passthrough_orig_dtypes = quant_obj.get("passthrough_orig_dtypes", {})
+
     for name, q in quant_obj["quantized"].items():
         q_np = np.asarray(q, dtype=np.int8)
         dtype_name = str(quant_obj["dtypes"][name])
@@ -221,9 +156,7 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, np.nda
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
         out[name] = np.ascontiguousarray(out_arr.astype(np.dtype(dtype_name), copy=False))
-    for name, spec in quant_obj.get("svd_factors", {}).items():
-        dtype_name = str(spec["dtype"])
-        out[name] = reconstruct_svd_factorized_array(spec).astype(np.dtype(dtype_name), copy=False)
+
     for name, arr in quant_obj["passthrough"].items():
         out_arr = np.ascontiguousarray(np.array(arr, copy=True))
         orig_dtype = passthrough_orig_dtypes.get(name)
@@ -231,4 +164,5 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, np.nda
             out[name] = out_arr.astype(np.dtype(orig_dtype), copy=False)
         else:
             out[name] = out_arr
+
     return out

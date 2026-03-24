@@ -104,7 +104,6 @@ class Hyperparameters:
     # which can be reinvested in higher MLP ranks.
     svd_use_qkv = bool(int(os.environ.get("SVD_USE_QKV", "1")))
     svd_rank_qkv = int(os.environ.get("SVD_RANK_QKV", os.environ.get("SVD_RANK_QK", "128")))
-    svd_export_float_dtype = os.environ.get("SVD_EXPORT_FLOAT_DTYPE", "float16")
     svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
     svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
     svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
@@ -371,8 +370,8 @@ def eval_val(
 # -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
+# Instead, we quantize the factorized model state to int8 where appropriate and zlib compress it.
+# We then decompress the artifact and run the round-tripped weights in higher precision for evaluation.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -403,8 +402,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], args: Hyperparameter
     return quantize_state_dict_int8_np(
         np_state,
         keep_float_fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
-        svd_rank_lookup=lambda name: svd_rank_for_name(name, args),
-        svd_export_dtype=export_np_dtype(args.svd_export_float_dtype),
+        svd_rank_lookup=lambda name: 0,
+        svd_export_dtype=np.float16,
     )
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
@@ -1205,21 +1204,21 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8_svd.ptz", "wb") as f:
+        with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8_svd.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"serialized_model_int8_svd_zlib:{quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} svd_factor_bytes:{quant_stats['svd_factor_bytes']} "
-            f"raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+            f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} "
+            f"payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8_svd+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8_svd.ptz", "rb") as f:
+    with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = pickle.loads(zlib.decompress(quant_blob_disk))
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
@@ -1239,10 +1238,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_svd_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_svd_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
