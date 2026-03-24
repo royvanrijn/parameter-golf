@@ -86,6 +86,13 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
 
+    vec_use_attention_refine = bool(int(os.environ.get("VEC_USE_ATTENTION_REFINE", "0")))
+    vec_attn_steps = int(os.environ.get("VEC_ATTN_STEPS", 200))
+    vec_attn_batch_size = int(os.environ.get("VEC_ATTN_BATCH_SIZE", 2048))
+    vec_attn_lr = float(os.environ.get("VEC_ATTN_LR", 0.05))
+    vec_neg_k = int(os.environ.get("VEC_NEG_K", 16))
+    vec_cooc_smooth = float(os.environ.get("VEC_COOC_SMOOTH", 1.0))
+
     vec_path = os.environ.get("VEC_PATH", "./vec_model.pkl")
     use_vec_input = bool(int(os.environ.get("USE_VEC_INPUT", "1")))
     use_hybrid_embed = bool(int(os.environ.get("USE_HYBRID_EMBED", "1")))
@@ -537,21 +544,72 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 
-def train_inline_vec_model(pattern: str, vocab_size: int, max_tokens: int, dim: int, window: int, device: torch.device) -> dict[str, object]:
-    from train_vec import build_cooc_ppmi_embeddings
+def train_inline_vec_model(
+    pattern: str,
+    vocab_size: int,
+    max_tokens: int,
+    dim: int,
+    window: int,
+    device: torch.device,
+    cooc_smooth: float,
+    use_attention_refine: bool,
+    attn_steps: int,
+    attn_batch_size: int,
+    attn_lr: float,
+    neg_k: int,
+    seed: int,
+) -> dict[str, object]:
+    from train_vec import build_cooc_ppmi_embeddings, refine_with_tiny_attention
 
     stream = TokenStream(pattern)
     tokens = stream.take(max_tokens).to(dtype=torch.int64).cpu().numpy().astype(np.int32, copy=False)
-    emb, _ = build_cooc_ppmi_embeddings(
+
+    emb, fit_info = build_cooc_ppmi_embeddings(
         tokens=tokens,
         vocab_size=vocab_size,
         dim=dim,
         window=window,
         device=device,
-        smooth=1.0,
+        smooth=cooc_smooth,
     )
-    return {"embeddings": emb.detach().cpu().numpy().astype(np.float32, copy=False), "vocab_size": int(vocab_size), "dim": int(dim)}
 
+    attention_weights = None
+    if use_attention_refine:
+        emb, attention, attn_info = refine_with_tiny_attention(
+            init_emb=emb,
+            tokens=tokens,
+            vocab_size=vocab_size,
+            window=window,
+            steps=attn_steps,
+            batch_size=attn_batch_size,
+            lr=attn_lr,
+            neg_k=neg_k,
+            device=device,
+            seed=seed,
+        )
+        fit_info.update(attn_info)
+        attention_weights = attention.weights
+
+    return {
+        "embeddings": emb.detach().cpu().numpy().astype(np.float32, copy=False),
+        "vocab_size": int(vocab_size),
+        "dim": int(dim),
+        "window": int(window),
+        "config": {
+            "max_tokens": int(max_tokens),
+            "vec_dim": int(dim),
+            "window": int(window),
+            "cooc_smooth": float(cooc_smooth),
+            "use_attention_refine": bool(use_attention_refine),
+            "attn_steps": int(attn_steps),
+            "attn_batch_size": int(attn_batch_size),
+            "attn_lr": float(attn_lr),
+            "neg_k": int(neg_k),
+            "seed": int(seed),
+        },
+        "attention_weights": None if attention_weights is None else np.asarray(attention_weights, dtype=np.float32),
+        "fit_info": fit_info,
+    }
 
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
@@ -908,7 +966,14 @@ def main() -> None:
                     max_tokens=args.vec_train_tokens,
                     dim=max(args.vec_dim, 1),
                     window=max(args.vec_train_window, 1),
-                    device=torch.device("cpu"),   # keep vec training off GPU
+                    device=torch.device("cpu"),
+                    cooc_smooth=args.vec_cooc_smooth,
+                    use_attention_refine=args.vec_use_attention_refine,
+                    attn_steps=args.vec_attn_steps,
+                    attn_batch_size=args.vec_attn_batch_size,
+                    attn_lr=args.vec_attn_lr,
+                    neg_k=args.vec_neg_k,
+                    seed=args.seed,
                 )
                 vec_table_np = get_vec_table(payload)
                 if vec_table_np.shape[0] != args.vocab_size:
