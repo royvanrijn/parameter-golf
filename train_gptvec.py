@@ -892,29 +892,50 @@ def main() -> None:
     vec_setup_time_ms = 0.0
     vec_table_t = None
     vec_dim = None
+
     if args.use_vec_input or args.aux_vec_loss_weight > 0:
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         vec_setup_t0 = time.perf_counter()
+
+        payload = None
+        vec_table_np = None
+
         if args.inline_vec_train:
             if master_process:
                 log0(f"[vec] training inline vec model for {args.vec_train_tokens} tokens")
-            payload = train_inline_vec_model(
-                pattern=args.train_files,
-                vocab_size=args.vocab_size,
-                max_tokens=args.vec_train_tokens,
-                dim=max(args.vec_proj_dim, 1),
-                window=max(args.vec_train_window, 1),
-                device=device,
-            )
-            if master_process:
+                payload = train_inline_vec_model(
+                    pattern=args.train_files,
+                    vocab_size=args.vocab_size,
+                    max_tokens=args.vec_train_tokens,
+                    dim=max(args.vec_dim, 1),               # use a real VEC_DIM arg
+                    window=max(args.vec_train_window, 1),
+                    device=torch.device("cpu"),             # keep vec training off GPU
+                )
+                if args.vec_path:
+                    save_vec_artifact(payload, args.vec_path)   # implement if not present
                 log0("[vec] training done")
+
+            if distributed:
+                dist.barrier()
+
+            if not master_process:
+                payload = load_vec_artifact(args.vec_path)
+
         else:
             payload = load_vec_artifact(args.vec_path)
 
         vec_table_np = get_vec_table(payload)
+        if vec_table_np.shape[0] != args.vocab_size:
+            raise RuntimeError(
+                f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, args.vocab_size={args.vocab_size}"
+            )
+
         vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
         vec_dim = int(vec_table_t.shape[1])
-        torch.cuda.synchronize()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         vec_setup_time_ms = 1000.0 * (time.perf_counter() - vec_setup_t0)
 
     base_model, model, optimizers = build_model_and_optimizers(args, vec_table_t)
