@@ -962,14 +962,16 @@ def main() -> None:
             fused=True,
         )
 
-        optimizer_muon_local = Muon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
-        for group in optimizer_muon_local.param_groups:
-            group["base_lr"] = args.matrix_lr
+        optimizer_muon_local = None
+        if matrix_params:
+            optimizer_muon_local = Muon(
+                matrix_params,
+                lr=args.matrix_lr,
+                momentum=args.muon_momentum,
+                backend_steps=args.muon_backend_steps,
+            )
+            for group in optimizer_muon_local.param_groups:
+                group["base_lr"] = args.matrix_lr
 
         optimizer_factor_local = torch.optim.Adam(
             [{"params": factor_params, "lr": args.matrix_lr * 0.5, "base_lr": args.matrix_lr * 0.5}],
@@ -985,12 +987,15 @@ def main() -> None:
             fused=True,
         )
 
-        opts: list[torch.optim.Optimizer] = [
-            optimizer_tok_local,
-            optimizer_muon_local,
-            optimizer_factor_local,
-            optimizer_scalar_local,
-        ]
+        opts: list[torch.optim.Optimizer] = [optimizer_tok_local]
+
+        if optimizer_muon_local is not None:
+            opts.append(optimizer_muon_local)
+
+        if factor_params:
+            opts.append(optimizer_factor_local)
+
+        opts.append(optimizer_scalar_local)
 
         if base_model.lm_head is not None:
             optimizer_head = torch.optim.Adam(
@@ -1005,6 +1010,12 @@ def main() -> None:
 
     optimizers, optimizer_muon = build_optimizers()
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+
+    log0(
+        f"optimizer_split: factors={len(factor_params)} "
+        f"muon_matrices={len(matrix_params)} "
+        f"scalars={len(scalar_params)}"
+    )
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
