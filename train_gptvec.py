@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Train a GPT-style sequence model in vector-embedding space.
+"""Train a GPT-style language model with optional pretrained vec features.
 
-Workflow:
-1) Run `train_vec.py` quickly to build a token<->vector embedding artifact.
-2) Load that artifact and map token ids to vectors.
-3) Train a causal transformer over vectors (predict next-token vector).
-4) Decode predictions back to tokens via nearest-neighbor in vector space.
-
-This intentionally acts like a wrapper around a learned token embedding space:
-  token -> vec -> GPT(vec) -> vec -> token
+Clean split:
+- `train_vec.py` produces the vec artifact.
+- `train_gptvec.py` consumes that artifact and trains a standard LM objective.
 """
 
 from __future__ import annotations
@@ -17,8 +12,6 @@ import argparse
 import json
 import os
 import random
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,20 +21,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from train_vec import TokenCorpus, VectorEmbeddingModel, find_token_files
+from train_vec import TokenCorpus, find_token_files
+from vec_model import get_vec_table, load_vec_artifact
 
 
 @dataclass
 class Hyperparameters:
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    vec_dim: int = int(os.environ.get("VEC_DIM", 16))
-    vec_window: int = int(os.environ.get("VEC_WINDOW", 8))
-    vec_max_train_tokens: int = int(os.environ.get("VEC_MAX_TRAIN_TOKENS", 500_000))
-    vec_val_tokens: int = int(os.environ.get("VEC_VAL_TOKENS", 50_000))
-    vec_metric_samples: int = int(os.environ.get("VEC_METRIC_SAMPLES", 4000))
-    vec_model_path: str = os.environ.get("VEC_MODEL_PATH", "./artifacts/gptvec_model.pkl")
-    vec_metrics_path: str = os.environ.get("VEC_METRICS_PATH", "./artifacts/gptvec_metrics.json")
+
+    vec_path: str = os.environ.get("VEC_PATH", "./artifacts/gptvec_model.pkl")
+    use_vec_input: bool = bool(int(os.environ.get("USE_VEC_INPUT", "1")))
+    use_hybrid_embed: bool = bool(int(os.environ.get("USE_HYBRID_EMBED", "1")))
+    freeze_vec: bool = bool(int(os.environ.get("FREEZE_VEC", "1")))
+    vec_proj_dim: int = int(os.environ.get("VEC_PROJ_DIM", 256))
+    aux_vec_loss_weight: float = float(os.environ.get("AUX_VEC_LOSS_WEIGHT", 0.0))
 
     model_dim: int = int(os.environ.get("MODEL_DIM", 256))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
@@ -62,82 +56,95 @@ class Hyperparameters:
     save_checkpoint: str = os.environ.get("SAVE_CHECKPOINT", "./artifacts/gptvec_checkpoint.pt")
 
 
-class VecCausalTransformer(nn.Module):
-    def __init__(self, vec_dim: int, model_dim: int, num_heads: int, num_layers: int, mlp_mult: int, dropout: float, max_seq_len: int):
+class GPTVecLM(nn.Module):
+    def __init__(self, args: Hyperparameters, vec_table: torch.Tensor | None):
         super().__init__()
-        self.max_seq_len = max_seq_len
-        self.input_proj = nn.Linear(vec_dim, model_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))
+        self.args = args
+        self.max_seq_len = args.seq_len
 
-        ff_dim = model_dim * mlp_mult
+        self.token_embedding = nn.Embedding(args.vocab_size, args.model_dim)
+
+        self.use_vec_input = bool(args.use_vec_input and vec_table is not None)
+        self.use_hybrid_embed = bool(args.use_hybrid_embed)
+
+        if vec_table is not None:
+            if args.freeze_vec:
+                self.register_buffer("vec_table", vec_table)
+                self.vec_embedding = None
+            else:
+                self.vec_table = None
+                self.vec_embedding = nn.Embedding.from_pretrained(vec_table, freeze=False)
+            vec_dim = int(vec_table.shape[1])
+            proj_in = args.vec_proj_dim if args.vec_proj_dim > 0 else vec_dim
+            self.vec_preproj = nn.Identity() if proj_in == vec_dim else nn.Linear(vec_dim, proj_in)
+            self.vec_proj = nn.Linear(proj_in, args.model_dim)
+            self.vec_head = nn.Linear(args.model_dim, vec_dim) if args.aux_vec_loss_weight > 0 else None
+        else:
+            self.vec_table = None
+            self.vec_embedding = None
+            self.vec_preproj = None
+            self.vec_proj = None
+            self.vec_head = None
+
+        self.pos_emb = nn.Parameter(torch.zeros(1, args.seq_len, args.model_dim))
+
+        ff_dim = args.model_dim * args.mlp_mult
         enc_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
+            d_model=args.model_dim,
+            nhead=args.num_heads,
             dim_feedforward=ff_dim,
-            dropout=dropout,
+            dropout=args.dropout,
             activation="gelu",
             batch_first=True,
             norm_first=True,
         )
-        self.backbone = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(model_dim)
-        self.output_proj = nn.Linear(model_dim, vec_dim)
+        self.backbone = nn.TransformerEncoder(enc_layer, num_layers=args.num_layers)
+        self.norm = nn.LayerNorm(args.model_dim)
+        self.lm_head = nn.Linear(args.model_dim, args.vocab_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, vec_dim]
-        b, t, _ = x.shape
+    def lookup_vec(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.vec_embedding is not None:
+            return self.vec_embedding(tokens)
+        if self.vec_table is not None:
+            return self.vec_table[tokens]
+        raise RuntimeError("Vec lookup requested but no vec table is configured")
+
+    def forward(self, x_tok: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        b, t = x_tok.shape
         if t > self.max_seq_len:
             raise ValueError(f"Sequence length {t} exceeds max_seq_len={self.max_seq_len}")
-        h = self.input_proj(x) + self.pos_emb[:, :t, :]
-        mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
+
+        tok_h = self.token_embedding(x_tok)
+        h = tok_h
+        if self.use_vec_input:
+            vec_h = self.vec_proj(self.vec_preproj(self.lookup_vec(x_tok)))
+            h = h + vec_h if self.use_hybrid_embed else vec_h
+
+        h = h + self.pos_emb[:, :t, :]
+        mask = torch.triu(torch.ones(t, t, device=x_tok.device, dtype=torch.bool), diagonal=1)
         h = self.backbone(h, mask=mask)
         h = self.norm(h)
-        return self.output_proj(h)
+        logits = self.lm_head(h)
+        vec_pred = self.vec_head(h) if self.vec_head is not None else None
+        return logits, vec_pred
 
 
 def parse_args() -> Hyperparameters:
-    parser = argparse.ArgumentParser(description="Train GPT over token vector embeddings via train_vec delegate")
+    parser = argparse.ArgumentParser(description="Train GPT with standard CE loss and optional vec-side inputs")
     defaults = Hyperparameters()
-    for field_name, field_def in defaults.__dataclass_fields__.items():
+    for field_name in defaults.__dataclass_fields__:
         val = getattr(defaults, field_name)
         arg = f"--{field_name}"
         if isinstance(val, bool):
-            parser.add_argument(arg, action="store_true", default=val)
+            parser.add_argument(arg, type=int, choices=[0, 1], default=int(val))
         else:
             parser.add_argument(arg, type=type(val), default=val)
     ns = parser.parse_args()
-    return Hyperparameters(**vars(ns))
-
-
-def run_train_vec(args: Hyperparameters) -> None:
-    os.makedirs(Path(args.vec_model_path).parent, exist_ok=True)
-    os.makedirs(Path(args.vec_metrics_path).parent, exist_ok=True)
-    cmd = [
-        sys.executable,
-        "train_vec.py",
-        "--data_path",
-        args.data_path,
-        "--vocab_size",
-        str(args.vocab_size),
-        "--max_train_tokens",
-        str(args.vec_max_train_tokens),
-        "--val_tokens",
-        str(args.vec_val_tokens),
-        "--vec_dim",
-        str(args.vec_dim),
-        "--window",
-        str(args.vec_window),
-        "--metric_samples",
-        str(args.vec_metric_samples),
-        "--seed",
-        str(args.seed),
-        "--save_model",
-        args.vec_model_path,
-        "--save_metrics",
-        args.vec_metrics_path,
-    ]
-    print("[gptvec] running delegate:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    values = vars(ns)
+    for k, v in list(values.items()):
+        if isinstance(getattr(defaults, k), bool):
+            values[k] = bool(v)
+    return Hyperparameters(**values)
 
 
 def sample_batch(tokens: torch.Tensor, batch_size: int, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -150,14 +157,9 @@ def sample_batch(tokens: torch.Tensor, batch_size: int, seq_len: int, device: to
 
 
 @torch.no_grad()
-def token_accuracy_from_vectors(pred_vec: torch.Tensor, target_tok: torch.Tensor, embedding_table: torch.Tensor) -> float:
-    # pred_vec: [B,T,D], target_tok: [B,T], embedding_table: [V,D]
-    p = F.normalize(pred_vec.reshape(-1, pred_vec.shape[-1]), dim=1)
-    emb = F.normalize(embedding_table, dim=1)
-    logits = p @ emb.t()
-    pred_ids = logits.argmax(dim=1)
-    acc = (pred_ids == target_tok.reshape(-1)).float().mean().item()
-    return float(acc)
+def token_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
+    preds = logits.argmax(dim=-1)
+    return float((preds == targets).float().mean().item())
 
 
 def main() -> None:
@@ -169,11 +171,17 @@ def main() -> None:
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     print(f"[gptvec] device={device}")
 
-    t0 = time.time()
-    run_train_vec(args)
-    vec_model = VectorEmbeddingModel.load(args.vec_model_path)
-    if vec_model.dim != args.vec_dim:
-        raise RuntimeError(f"Vector dim mismatch: vec_model.dim={vec_model.dim}, expected={args.vec_dim}")
+    vec_table_t = None
+    vec_dim = None
+    if args.use_vec_input or args.aux_vec_loss_weight > 0:
+        payload = load_vec_artifact(args.vec_path)
+        vec_table_np = get_vec_table(payload)
+        if vec_table_np.shape[0] != args.vocab_size:
+            raise RuntimeError(
+                f"Vec vocab mismatch: table has {vec_table_np.shape[0]}, args.vocab_size={args.vocab_size}"
+            )
+        vec_table_t = torch.tensor(vec_table_np, dtype=torch.float32, device=device)
+        vec_dim = int(vec_table_t.shape[1])
 
     files = find_token_files(args.data_path)
     if not files:
@@ -186,28 +194,24 @@ def main() -> None:
     train_tokens = torch.from_numpy(train_tokens_np).to(device)
     print(f"[gptvec] loaded train tokens={train_tokens.numel():,}")
 
-    emb_table = torch.tensor(vec_model.embeddings, dtype=torch.float32, device=device)
-    model = VecCausalTransformer(
-        vec_dim=args.vec_dim,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        mlp_mult=args.mlp_mult,
-        dropout=args.dropout,
-        max_seq_len=args.seq_len,
-    ).to(device)
-
+    model = GPTVecLM(args, vec_table_t).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     model.train()
     train_start = time.time()
     for step in range(1, args.iterations + 1):
         in_tok, tgt_tok = sample_batch(train_tokens, args.batch_size, args.seq_len, device=device)
-        in_vec = emb_table[in_tok]
-        tgt_vec = emb_table[tgt_tok]
+        logits, vec_pred = model(in_tok)
+        ce_loss = F.cross_entropy(logits.reshape(-1, args.vocab_size), tgt_tok.reshape(-1))
 
-        pred_vec = model(in_vec)
-        loss = F.mse_loss(pred_vec, tgt_vec)
+        aux_loss = torch.zeros((), device=device)
+        if args.aux_vec_loss_weight > 0:
+            if vec_pred is None or vec_table_t is None:
+                raise RuntimeError("Aux vec loss requested but vec head/table is unavailable")
+            tgt_vec = vec_table_t[tgt_tok]
+            aux_loss = F.mse_loss(vec_pred, tgt_vec)
+
+        loss = ce_loss + args.aux_vec_loss_weight * aux_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -217,31 +221,31 @@ def main() -> None:
 
         if step % args.log_every == 0 or step == 1 or step == args.iterations:
             with torch.no_grad():
-                acc = token_accuracy_from_vectors(pred_vec, tgt_tok, emb_table)
-            print(f"[gptvec][step {step:6d}/{args.iterations}] loss={loss.item():.6f} token_top1={acc:.4f}")
+                acc = token_accuracy(logits, tgt_tok)
+            print(
+                f"[gptvec][step {step:6d}/{args.iterations}] "
+                f"loss={loss.item():.6f} ce={ce_loss.item():.6f} "
+                f"aux={aux_loss.item():.6f} token_top1={acc:.4f}"
+            )
 
     elapsed = time.time() - train_start
-    total_elapsed = time.time() - t0
 
     os.makedirs(Path(args.save_checkpoint).parent, exist_ok=True)
     ckpt = {
         "model_state": model.state_dict(),
         "args": vars(args),
-        "vec_model_path": args.vec_model_path,
-        "vec_metrics_path": args.vec_metrics_path,
+        "vec_path": args.vec_path,
+        "vec_dim": vec_dim,
         "train_seconds": elapsed,
-        "total_seconds": total_elapsed,
     }
     torch.save(ckpt, args.save_checkpoint)
 
     summary = {
         "checkpoint": args.save_checkpoint,
-        "vec_model": args.vec_model_path,
-        "vec_metrics": args.vec_metrics_path,
+        "vec_path": args.vec_path,
         "train_tokens": int(train_tokens.numel()),
         "iterations": args.iterations,
         "train_seconds": float(elapsed),
-        "total_seconds": float(total_elapsed),
         "device": str(device),
     }
     print("[gptvec] " + json.dumps(summary, indent=2, sort_keys=True))
