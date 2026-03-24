@@ -122,6 +122,8 @@ class GPTVecLM(nn.Module):
         if t > self.max_seq_len:
             raise ValueError(f"Sequence length {t} exceeds max_seq_len={self.max_seq_len}")
 
+        x_tok = x_tok.long()
+
         tok_h = self.token_embedding(x_tok)
         h = tok_h
         if self.use_vec_input:
