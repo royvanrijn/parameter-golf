@@ -8,11 +8,12 @@ import gc
 import gzip
 import json
 import math
+import os
 import pickle
 import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Counter, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -116,7 +117,7 @@ class TokenCorpus:
 
 
 # -----------------------------
-# Hashing / stats
+# Hashing / helpers
 # -----------------------------
 
 
@@ -125,6 +126,14 @@ def hash_context(ctx: np.ndarray, order: int, base: np.uint64 = np.uint64(131542
     for i in range(order):
         h = h * base + ctx[:, i].astype(np.uint64) + np.uint64(1)
     return h
+
+
+def hash_history_view(history: np.ndarray, order: int, base: np.uint64 = np.uint64(1315423911)) -> int:
+    h = np.uint64(0)
+    start = history.shape[0] - order
+    for i in range(start, history.shape[0]):
+        h = h * base + np.uint64(int(history[i]) + 1)
+    return int(h)
 
 
 def choose_train_val_ranges(total_tokens: int, val_tokens: int, max_train_tokens: Optional[int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
@@ -145,49 +154,47 @@ def choose_train_val_ranges(total_tokens: int, val_tokens: int, max_train_tokens
 
 
 @dataclass
-class EntryStats:
-    token: int
-    count: int
-    score: float
-
-
-@dataclass
-class ContextStats:
+class ContextCandidate:
     order: int
     ctx_hash: int
-    entries: List[EntryStats]
+    entries: List[Tuple[int, int]]
     total_count: int
-    utility: float
-    utility_per_byte: float
-    size_bytes: int
+    unique_count: int
+    continuation_mass: int
+    bytes_cost: int
+    utility_bits: float = 0.0
+    hits: int = 0
+
+    @property
+    def utility_per_byte(self) -> float:
+        return self.utility_bits / max(1, self.bytes_cost)
 
 
-@dataclass
-class OrderStats:
-    contexts: Dict[int, Counter[int]]
-
-
-class SparsePPM:
+class SparsePPMV2:
     def __init__(
         self,
         vocab_size: int,
         max_order: int,
         topk_per_context: int,
         min_count: int,
-        lambdas: Optional[List[float]] = None,
+        discount: float = 0.75,
+        base_alpha: float = 0.02,
     ):
         self.vocab_size = vocab_size
         self.max_order = max_order
         self.topk_per_context = topk_per_context
         self.min_count = min_count
+        self.discount = discount
+        self.base_alpha = base_alpha
+
         self.unigram = np.zeros((vocab_size,), dtype=np.int64)
         self.total_unigrams = 0
-        self.orders: Dict[int, OrderStats] = {}
-        if lambdas is None:
-            raw = [1.0] + [0.7 ** (max_order - i) for i in range(1, max_order + 1)]
-            s = sum(raw)
-            lambdas = [x / s for x in raw]
-        self.lambdas = lambdas
+        self.continuation_unigram = np.ones((vocab_size,), dtype=np.int64)
+        self.total_continuations = int(self.continuation_unigram.sum())
+
+        # final selected model
+        self.orders: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray, int, int]]] = {}
+        self.context_counts_per_order: Dict[int, int] = {}
 
     def fit_raw(
         self,
@@ -226,148 +233,315 @@ class SparsePPM:
                 for u, c in zip(uniq.tolist(), counts.tolist()):
                     cnt[u] += int(c)
             if num_chunks % report_every_chunks == 0:
-                eprint(f"[ppm] processed chunk {num_chunks}, tokens up to {end:,}/{n:,}")
+                eprint(f"[ppm] processed chunk {num_chunks}, tokens up to {min(start + chunk_tokens, n):,}/{n:,}")
                 gc.collect()
+
+        # Kneser-Ney-ish continuation unigram from bigrams: distinct predecessor contexts per token.
+        continuation = np.zeros((self.vocab_size,), dtype=np.int64)
+        seen_bigram = pair_counters.get(1, {})
+        for packed in seen_bigram.keys():
+            tok = int(packed % self.vocab_size)
+            continuation[tok] += 1
+        continuation += 1  # smoothing
+        self.continuation_unigram = continuation
+        self.total_continuations = int(continuation.sum())
         return pair_counters
 
-    def _base_prob(self, token: int, alpha: float = 0.1) -> float:
-        return (self.unigram[token] + alpha) / (self.total_unigrams + alpha * self.vocab_size)
+    def base_prob(self, token: int) -> float:
+        # Mix continuation unigram with regular unigram.
+        p_cont = self.continuation_unigram[token] / self.total_continuations
+        p_uni = (self.unigram[token] + self.base_alpha) / (self.total_unigrams + self.base_alpha * self.vocab_size)
+        return 0.85 * p_cont + 0.15 * p_uni
 
-    def extract_from_raw(
+    @staticmethod
+    def _context_bytes(entry_count: int) -> int:
+        # Packed-ish estimate: hash + totals/metadata + entries.
+        return 16 + entry_count * 4
+
+    def _ctx_prob_from_tuple(
+        self,
+        ctx_data: Tuple[np.ndarray, np.ndarray, int, int],
+        token: int,
+        lower_prob: float,
+    ) -> float:
+        tokens, counts, total_count, continuation_mass = ctx_data
+        if total_count <= 0:
+            return lower_prob
+        idx = np.searchsorted(tokens, token)
+        c = int(counts[idx]) if idx < tokens.shape[0] and int(tokens[idx]) == token else 0
+        d = self.discount
+        num_types = tokens.shape[0]
+        bow = min(0.999999, d * num_types / total_count)
+        p = bow * lower_prob
+        if c > 0:
+            p += max(c - d, 0.0) / total_count
+        return max(1e-12, p)
+
+    def _candidate_prob(
+        self,
+        cand: ContextCandidate,
+        token: int,
+        lower_prob: float,
+    ) -> float:
+        total_count = cand.total_count
+        if total_count <= 0:
+            return lower_prob
+        c = 0
+        # entries sorted by token id
+        lo, hi = 0, len(cand.entries)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            tm = cand.entries[mid][0]
+            if tm < token:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(cand.entries) and cand.entries[lo][0] == token:
+            c = cand.entries[lo][1]
+        d = self.discount
+        bow = min(0.999999, d * max(1, cand.continuation_mass) / total_count)
+        p = bow * lower_prob
+        if c > 0:
+            p += max(c - d, 0.0) / total_count
+        return max(1e-12, p)
+
+    def _build_candidates(
         self,
         raw_pair_counters: Dict[int, Counter[int]],
-        target_size_bytes: Optional[int] = None,
-        temp_topk_per_context: Optional[int] = None,
-        max_contexts_per_order: Optional[int] = None,
-    ) -> Dict[str, float]:
-        temp_topk = temp_topk_per_context or max(self.topk_per_context * 4, self.topk_per_context)
-        all_contexts: List[ContextStats] = []
-        initial_context_count = 0
-        initial_entry_count = 0
-
+        temp_topk_per_context: int,
+    ) -> Tuple[Dict[int, Dict[int, ContextCandidate]], Dict[str, float]]:
+        candidates: Dict[int, Dict[int, ContextCandidate]] = {o: {} for o in range(1, self.max_order + 1)}
+        initial_contexts = 0
+        initial_entries = 0
         for order in range(1, self.max_order + 1):
-            contexts: DefaultDict[int, Counter[int]] = collections.defaultdict(collections.Counter)
+            contexts: DefaultDict[int, Dict[int, int]] = collections.defaultdict(dict)
             for packed, c in raw_pair_counters[order].items():
                 if c < self.min_count:
                     continue
                 ctx_hash = int(packed // self.vocab_size)
-                token = int(packed % self.vocab_size)
-                contexts[ctx_hash][token] = int(c)
-            initial_context_count += len(contexts)
-
-            local_contexts: List[ContextStats] = []
-            for ctx_hash, ctr in contexts.items():
-                # keep larger temporary fanout first
-                items = ctr.items()
-                if len(ctr) > temp_topk:
-                    items = ctr.most_common(temp_topk)
-                else:
-                    items = list(items)
+                tok = int(packed % self.vocab_size)
+                contexts[ctx_hash][tok] = int(c)
+            initial_contexts += len(contexts)
+            eprint(f"[extract] order={order}: candidate_contexts={len(contexts):,}")
+            for ctx_hash, token_counts in contexts.items():
+                items = sorted(token_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:temp_topk_per_context]
+                items.sort(key=lambda kv: kv[0])
+                if not items:
+                    continue
                 total = int(sum(c for _, c in items))
-                if total <= 0:
-                    continue
-                entries: List[EntryStats] = []
-                utility = 0.0
-                for token, count in items:
-                    p_base = self._base_prob(token)
-                    p_ctx = count / total
-                    gain = max(0.0, math.log2(max(p_ctx, 1e-12) / max(p_base, 1e-12)))
-                    score = count * gain
-                    if score <= 0.0:
-                        continue
-                    entries.append(EntryStats(token=int(token), count=int(count), score=float(score)))
-                    utility += score
-                if not entries:
-                    continue
-                entries.sort(key=lambda e: (-e.score, -e.count, e.token))
-                if len(entries) > self.topk_per_context:
-                    entries = entries[: self.topk_per_context]
-                    total = int(sum(e.count for e in entries))
-                    utility = float(sum(e.score for e in entries))
-                size_bytes = 8 + len(entries) * 4
-                utility_per_byte = utility / max(size_bytes, 1)
-                local_contexts.append(
-                    ContextStats(
-                        order=order,
-                        ctx_hash=ctx_hash,
-                        entries=entries,
-                        total_count=total,
-                        utility=utility,
-                        utility_per_byte=utility_per_byte,
-                        size_bytes=size_bytes,
-                    )
+                cand = ContextCandidate(
+                    order=order,
+                    ctx_hash=ctx_hash,
+                    entries=items,
+                    total_count=total,
+                    unique_count=len(token_counts),
+                    continuation_mass=len(items),
+                    bytes_cost=self._context_bytes(len(items)),
                 )
-                initial_entry_count += len(entries)
-
-            local_contexts.sort(key=lambda c: (-c.utility_per_byte, -c.utility, -c.order, c.ctx_hash))
-            if max_contexts_per_order is not None:
-                local_contexts = local_contexts[:max_contexts_per_order]
-            all_contexts.extend(local_contexts)
-            eprint(f"[extract] order={order}: candidate_contexts={len(local_contexts):,}")
-
-        all_contexts.sort(key=lambda c: (-c.utility_per_byte, -c.utility, -c.order, c.ctx_hash))
-        chosen: List[ContextStats]
-        if target_size_bytes is None:
-            chosen = all_contexts
-        else:
-            size = self.unigram.nbytes
-            chosen = []
-            for ctx in all_contexts:
-                if size + ctx.size_bytes > target_size_bytes:
-                    continue
-                chosen.append(ctx)
-                size += ctx.size_bytes
-
-        chosen_by_order: Dict[int, Dict[int, Counter[int]]] = {order: {} for order in range(1, self.max_order + 1)}
-        for ctx in chosen:
-            chosen_by_order[ctx.order][ctx.ctx_hash] = collections.Counter({e.token: e.count for e in ctx.entries})
-        self.orders = {order: OrderStats(contexts=ctxs) for order, ctxs in chosen_by_order.items() if ctxs}
-
-        estimated = self.estimated_size_bytes()
-        return {
-            "candidate_contexts": float(len(all_contexts)),
-            "selected_contexts": float(sum(len(v.contexts) for v in self.orders.values())),
-            "selected_entries": float(sum(len(c) for o in self.orders.values() for c in o.contexts.values())),
-            "initial_contexts_after_min_count": float(initial_context_count),
-            "initial_entries_after_filtering": float(initial_entry_count),
-            "estimated_model_size_bytes": float(estimated),
-            "estimated_model_size_mb": float(estimated / (1024 * 1024)),
+                candidates[order][ctx_hash] = cand
+                initial_entries += len(items)
+        stats = {
+            "initial_contexts_after_min_count": float(initial_contexts),
+            "initial_entries_after_filtering": float(initial_entries),
+            "candidate_contexts": float(sum(len(v) for v in candidates.values())),
         }
+        return candidates, stats
 
-    def prob_next(self, history: np.ndarray, target: int, alpha: float = 0.1) -> float:
-        p = self.lambdas[0] * self._base_prob(target, alpha=alpha)
-        for order in range(1, self.max_order + 1):
-            if history.shape[0] < order:
-                continue
-            ctx = history[-order:].reshape(1, order)
-            h = int(hash_context(ctx, order)[0])
-            stats = self.orders.get(order)
-            if stats is None:
-                continue
-            ctr = stats.contexts.get(h)
-            if not ctr:
-                continue
-            total = sum(ctr.values())
-            bucket = len(ctr)
-            p_order = (ctr.get(target, 0) + alpha) / (total + alpha * max(bucket, 1))
-            p += self.lambdas[order] * p_order
-        return max(float(p), 1e-12)
-
-    def evaluate(
+    def _score_candidates_on_validation(
         self,
-        tokens: np.ndarray,
-        byte_lengths: Optional[np.ndarray] = None,
-        log_every: int = 1_000_000,
-        history_cap: int = 256,
+        candidates: Dict[int, Dict[int, ContextCandidate]],
+        val_tokens: np.ndarray,
+        val_sample_positions: int,
+        sample_seed: int,
+    ) -> None:
+        n = val_tokens.shape[0]
+        usable = np.arange(self.max_order, n, dtype=np.int64)
+        if val_sample_positions and val_sample_positions < usable.shape[0]:
+            rng = np.random.default_rng(sample_seed)
+            idx = np.sort(rng.choice(usable, size=val_sample_positions, replace=False))
+        else:
+            idx = usable
+        eprint(f"[extract] scoring candidates on {idx.shape[0]:,} validation positions")
+
+        for pos in idx.tolist():
+            tgt = int(val_tokens[pos])
+            lower = self.base_prob(tgt)
+            history = val_tokens[max(0, pos - self.max_order):pos]
+            for order in range(1, min(self.max_order, history.shape[0]) + 1):
+                ctx_hash = hash_history_view(history, order)
+                cand = candidates[order].get(ctx_hash)
+                if cand is None:
+                    continue
+                p_with = self._candidate_prob(cand, tgt, lower)
+                # Gain against backing off directly to lower order.
+                gain = math.log2(p_with) - math.log2(lower)
+                if gain > 0.0:
+                    cand.utility_bits += gain
+                cand.hits += 1
+                lower = p_with
+
+    def _select_under_budget(
+        self,
+        candidates: Dict[int, Dict[int, ContextCandidate]],
+        target_size_bytes: int,
+        topk_per_context: int,
+    ) -> Tuple[Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray, int, int]]], Dict[str, float]]:
+        # Base size: unigram + continuation unigram + lightweight metadata.
+        current_size = int(self.unigram.nbytes + self.continuation_unigram.nbytes + 4096)
+        remaining = max(0, target_size_bytes - current_size)
+
+        # Turn each context into several prefix options so we can fill the budget more gracefully.
+        prefix_items: List[Tuple[float, float, int, int, int]] = []
+        # (utility_per_byte, utility, order, ctx_hash, keep_len)
+        for order in range(1, self.max_order + 1):
+            for ctx_hash, cand in candidates[order].items():
+                if cand.utility_bits <= 0.0:
+                    continue
+                max_keep = min(topk_per_context, len(cand.entries))
+                # value prefixes by count strength, but utility is context-level. distribute with diminishing returns.
+                prefix_counts = [c for _, c in sorted(cand.entries, key=lambda kv: (-kv[1], kv[0]))[:max_keep]]
+                total_prefix = sum(prefix_counts)
+                running = 0
+                for keep_len in range(1, max_keep + 1):
+                    running += prefix_counts[keep_len - 1]
+                    frac = running / max(1, total_prefix)
+                    util = cand.utility_bits * (frac ** 0.85)
+                    bytes_cost = self._context_bytes(keep_len)
+                    prefix_items.append((util / max(1, bytes_cost), util, order, ctx_hash, keep_len))
+
+        # Greedily pick best prefixes, keeping only best prefix per context.
+        prefix_items.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_keep: Dict[Tuple[int, int], int] = {}
+        best_util: Dict[Tuple[int, int], float] = {}
+        selected_size = 0
+        for upb, util, order, ctx_hash, keep_len in prefix_items:
+            key = (order, ctx_hash)
+            prev_keep = best_keep.get(key, 0)
+            prev_size = self._context_bytes(prev_keep) if prev_keep > 0 else 0
+            new_size = self._context_bytes(keep_len)
+            delta = new_size - prev_size
+            if delta <= 0:
+                continue
+            if selected_size + delta > remaining:
+                continue
+            prev_util = best_util.get(key, 0.0)
+            if util <= prev_util:
+                continue
+            best_keep[key] = keep_len
+            best_util[key] = util
+            selected_size += delta
+
+        # Second pass: exact fill with smaller upgrades if budget remains.
+        leftovers = remaining - selected_size
+        if leftovers > 0:
+            upgrades: List[Tuple[float, int, int, int]] = []
+            for order in range(1, self.max_order + 1):
+                for ctx_hash, cand in candidates[order].items():
+                    key = (order, ctx_hash)
+                    cur = best_keep.get(key, 0)
+                    max_keep = min(topk_per_context, len(cand.entries))
+                    if cur >= max_keep:
+                        continue
+                    next_keep = cur + 1
+                    old_size = self._context_bytes(cur) if cur > 0 else 0
+                    new_size = self._context_bytes(next_keep)
+                    delta_size = new_size - old_size
+                    if delta_size <= 0:
+                        continue
+                    sorted_entries = sorted(cand.entries, key=lambda kv: (-kv[1], kv[0]))[:max_keep]
+                    total_prefix = sum(c for _, c in sorted_entries)
+                    prev_frac = sum(c for _, c in sorted_entries[:cur]) / max(1, total_prefix)
+                    new_frac = sum(c for _, c in sorted_entries[:next_keep]) / max(1, total_prefix)
+                    prev_util = cand.utility_bits * (prev_frac ** 0.85) if cur > 0 else 0.0
+                    new_util = cand.utility_bits * (new_frac ** 0.85)
+                    delta_util = max(0.0, new_util - prev_util)
+                    upgrades.append((delta_util / delta_size if delta_size else 0.0, order, ctx_hash, next_keep))
+            upgrades.sort(reverse=True)
+            for upb, order, ctx_hash, next_keep in upgrades:
+                key = (order, ctx_hash)
+                cur = best_keep.get(key, 0)
+                if next_keep != cur + 1:
+                    continue
+                old_size = self._context_bytes(cur) if cur > 0 else 0
+                new_size = self._context_bytes(next_keep)
+                delta_size = new_size - old_size
+                if delta_size <= leftovers:
+                    best_keep[key] = next_keep
+                    leftovers -= delta_size
+                    if leftovers <= 0:
+                        break
+
+        final_orders: Dict[int, Dict[int, Tuple[np.ndarray, np.ndarray, int, int]]] = {o: {} for o in range(1, self.max_order + 1)}
+        selected_contexts = 0
+        selected_entries = 0
+        used_size = current_size
+        for order in range(1, self.max_order + 1):
+            for ctx_hash, cand in candidates[order].items():
+                keep_len = best_keep.get((order, ctx_hash), 0)
+                if keep_len <= 0:
+                    continue
+                # keep highest-count entries, store sorted by token id for binary search
+                kept = sorted(cand.entries, key=lambda kv: (-kv[1], kv[0]))[:keep_len]
+                kept.sort(key=lambda kv: kv[0])
+                tokens = np.array([t for t, _ in kept], dtype=np.uint16)
+                counts = np.array([min(65535, c) for _, c in kept], dtype=np.uint16)
+                total = int(sum(int(c) for c in counts.tolist()))
+                continuation_mass = int(len(kept))
+                final_orders[order][ctx_hash] = (tokens, counts, total, continuation_mass)
+                selected_contexts += 1
+                selected_entries += keep_len
+                used_size += self._context_bytes(keep_len)
+        stats = {
+            "selected_contexts": float(selected_contexts),
+            "selected_entries": float(selected_entries),
+            "estimated_model_size_bytes": float(min(used_size, target_size_bytes)),
+            "estimated_model_size_mb": float(min(used_size, target_size_bytes) / (1024 * 1024)),
+            "budget_fill_ratio": float(min(1.0, used_size / max(1, target_size_bytes))),
+            "graceful_unused_bytes": float(max(0, target_size_bytes - used_size)),
+        }
+        return final_orders, stats
+
+    def extract_from_raw(
+        self,
+        raw_pair_counters: Dict[int, Counter[int]],
+        val_tokens: np.ndarray,
+        target_size_bytes: Optional[int],
+        temp_topk_per_context: int,
+        val_sample_positions: int,
+        sample_seed: int,
     ) -> Dict[str, float]:
-        if tokens.shape[0] <= self.max_order:
-            raise ValueError("Validation set too small")
+        candidates, stats = self._build_candidates(raw_pair_counters, temp_topk_per_context=temp_topk_per_context)
+        self._score_candidates_on_validation(
+            candidates,
+            val_tokens,
+            val_sample_positions=val_sample_positions,
+            sample_seed=sample_seed,
+        )
+        target = target_size_bytes or (16 * 1024 * 1024)
+        final_orders, sel_stats = self._select_under_budget(candidates, target, self.topk_per_context)
+        self.orders = final_orders
+        self.context_counts_per_order = {o: len(v) for o, v in self.orders.items()}
+        stats.update(sel_stats)
+        return stats
+
+    def prob_next(self, history: np.ndarray, token: int) -> float:
+        p = self.base_prob(token)
+        max_order = min(self.max_order, history.shape[0])
+        for order in range(1, max_order + 1):
+            ctx_hash = hash_history_view(history, order)
+            ctx_data = self.orders.get(order, {}).get(ctx_hash)
+            if ctx_data is None:
+                continue
+            p = self._ctx_prob_from_tuple(ctx_data, token, p)
+        return max(1e-12, p)
+
+    def evaluate(self, tokens: np.ndarray, byte_lengths: Optional[np.ndarray] = None, log_every: int = 100_000) -> Dict[str, float]:
         total_nll_bits = 0.0
         total_tok = 0
         total_bytes = 0
         start_time = time.time()
         for i in range(self.max_order, tokens.shape[0]):
-            history = tokens[:i] if i < history_cap else tokens[i - history_cap:i]
+            history = tokens[max(0, i - self.max_order):i]
             tgt = int(tokens[i])
             p = self.prob_next(history, tgt)
             total_nll_bits += -math.log2(p)
@@ -393,11 +567,10 @@ class SparsePPM:
         return out
 
     def estimated_size_bytes(self) -> int:
-        size = self.unigram.nbytes
-        for stats in self.orders.values():
-            for ctr in stats.contexts.values():
-                size += 8
-                size += len(ctr) * 4
+        size = int(self.unigram.nbytes + self.continuation_unigram.nbytes + 4096)
+        for order_dict in self.orders.values():
+            for tokens, counts, _, _ in order_dict.values():
+                size += self._context_bytes(int(tokens.shape[0]))
         return size
 
     def save(self, path: str) -> None:
@@ -406,14 +579,28 @@ class SparsePPM:
             "max_order": self.max_order,
             "topk_per_context": self.topk_per_context,
             "min_count": self.min_count,
-            "lambdas": self.lambdas,
+            "discount": self.discount,
+            "base_alpha": self.base_alpha,
             "unigram": self.unigram,
+            "continuation_unigram": self.continuation_unigram,
             "total_unigrams": self.total_unigrams,
+            "total_continuations": self.total_continuations,
             "orders": {
-                order: {h: dict(ctr) for h, ctr in stats.contexts.items()}
-                for order, stats in self.orders.items()
+                order: {
+                    h: {
+                        "tokens": tokens,
+                        "counts": counts,
+                        "total_count": total_count,
+                        "continuation_mass": continuation_mass,
+                    }
+                    for h, (tokens, counts, total_count, continuation_mass) in order_dict.items()
+                }
+                for order, order_dict in self.orders.items()
             },
         }
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with gzip.open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -447,22 +634,24 @@ def infer_byte_lengths(vocab_size: int, tokenizer_path: Optional[str]) -> Option
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Token-level sparse PPM / interpolated n-gram baseline with big-build then extract/prune.")
-    p.add_argument("--data_path", type=str, required=True, help="Path to token shard directory or file (.bin/.npy/.npz/.pt)")
+    p = argparse.ArgumentParser(description="Token-level sparse PPM v2 with discounted backoff and validation-driven extraction.")
+    p.add_argument("--data_path", type=str, required=True)
     p.add_argument("--vocab_size", type=int, default=1024)
-    p.add_argument("--tokenizer_path", type=str, default=None, help="Optional SentencePiece model for approximate val_bpb")
+    p.add_argument("--tokenizer_path", type=str, default=None)
     p.add_argument("--max_order", type=int, default=4)
-    p.add_argument("--topk_per_context", type=int, default=8, help="Final kept continuations per context")
-    p.add_argument("--temp_topk_per_context", type=int, default=32, help="Temporary larger fanout before extraction")
+    p.add_argument("--topk_per_context", type=int, default=8)
+    p.add_argument("--temp_topk_per_context", type=int, default=32)
     p.add_argument("--min_count", type=int, default=2)
+    p.add_argument("--discount", type=float, default=0.75)
+    p.add_argument("--base_alpha", type=float, default=0.02)
     p.add_argument("--chunk_tokens", type=int, default=1_000_000)
     p.add_argument("--max_train_tokens", type=int, default=5_000_000)
     p.add_argument("--val_tokens", type=int, default=500_000)
-    p.add_argument("--target_size_mb", type=float, default=16.0, help="Extraction target size. Set <=0 to disable budgeted extraction")
-    p.add_argument("--max_contexts_per_order", type=int, default=0, help="Optional cap before global extraction; 0 disables")
+    p.add_argument("--val_sample_positions", type=int, default=100_000)
+    p.add_argument("--target_size_mb", type=float, default=16.0)
     p.add_argument("--seed", type=int, default=123)
-    p.add_argument("--save_model", type=str, default="/mnt/data/ppm_model.pkl.gz")
-    p.add_argument("--save_metrics", type=str, default="/mnt/data/ppm_metrics.json")
+    p.add_argument("--save_model", type=str, default="./ppm_model_v2.pkl.gz")
+    p.add_argument("--save_metrics", type=str, default="./ppm_metrics_v2.json")
     return p
 
 
@@ -490,11 +679,13 @@ def main() -> None:
 
     byte_lengths = infer_byte_lengths(args.vocab_size, args.tokenizer_path)
 
-    model = SparsePPM(
+    model = SparsePPMV2(
         vocab_size=args.vocab_size,
         max_order=args.max_order,
         topk_per_context=args.topk_per_context,
         min_count=args.min_count,
+        discount=args.discount,
+        base_alpha=args.base_alpha,
     )
 
     fit_start = time.time()
@@ -502,37 +693,46 @@ def main() -> None:
     fit_seconds = time.time() - fit_start
 
     extract_start = time.time()
-    target_size_bytes = None if args.target_size_mb <= 0 else int(args.target_size_mb * 1024 * 1024)
-    extraction = model.extract_from_raw(
+    extract_stats = model.extract_from_raw(
         raw_pair_counters,
-        target_size_bytes=target_size_bytes,
+        val_tokens=val_tokens,
+        target_size_bytes=int(args.target_size_mb * 1024 * 1024),
         temp_topk_per_context=args.temp_topk_per_context,
-        max_contexts_per_order=None if args.max_contexts_per_order <= 0 else args.max_contexts_per_order,
+        val_sample_positions=args.val_sample_positions,
+        sample_seed=args.seed,
     )
     extract_seconds = time.time() - extract_start
 
     eval_start = time.time()
     metrics = model.evaluate(val_tokens, byte_lengths=byte_lengths)
     eval_seconds = time.time() - eval_start
-    metrics.update(extraction)
+
     metrics.update(
         {
+            **extract_stats,
             "fit_seconds": fit_seconds,
             "extract_seconds": extract_seconds,
             "eval_seconds": eval_seconds,
+            "estimated_model_size_bytes": model.estimated_size_bytes(),
+            "estimated_model_size_mb": model.estimated_size_bytes() / (1024 * 1024),
             "train_tokens": int(train_tokens.shape[0]),
             "val_tokens_total": int(val_tokens.shape[0]),
             "max_order": args.max_order,
             "topk_per_context": args.topk_per_context,
             "temp_topk_per_context": args.temp_topk_per_context,
             "min_count": args.min_count,
+            "discount": args.discount,
+            "base_alpha": args.base_alpha,
             "target_size_mb": args.target_size_mb,
-            "estimated_model_size_mb": model.estimated_size_bytes() / (1024 * 1024),
+            "val_sample_positions": args.val_sample_positions,
         }
     )
 
     eprint("[result] " + json.dumps(metrics, indent=2, sort_keys=True))
     model.save(args.save_model)
+    parent = os.path.dirname(args.save_metrics)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(args.save_metrics, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)
     print(json.dumps(metrics, sort_keys=True))
