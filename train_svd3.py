@@ -509,10 +509,24 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    # x:   [..., rope_dim]
+    # cos: [1, 1, seq_len, rope_dim // 2]
+    # sin: [1, 1, seq_len, rope_dim // 2]
+    #
+    # Applies RoPE pairwise on adjacent channels:
+    # (x0, x1), (x2, x3), ...
+    rope_dim = x.size(-1)
+    if rope_dim % 2 != 0:
+        raise ValueError(f"RoPE dimension must be even, got {rope_dim}")
 
+    x = x.reshape(*x.shape[:-1], rope_dim // 2, 2)
+    x0 = x[..., 0]
+    x1 = x[..., 1]
+
+    y0 = x0 * cos - x1 * sin
+    y1 = x0 * sin + x1 * cos
+
+    return torch.stack((y0, y1), dim=-1).flatten(-2)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
