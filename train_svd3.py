@@ -784,8 +784,8 @@ def iter_named_svd_linears(model: GPT, args: Hyperparameters) -> list[tuple[str,
         out.append((f"blocks.{layer_idx}.mlp.proj", block.mlp.proj, args.svd_rank_proj))
         if args.svd_use_attn_proj:
             out.append((f"blocks.{layer_idx}.attn.proj", block.attn.proj, args.svd_rank_attn_proj))
-        if args.svd_use_qkv:
-            out.append((f"blocks.{layer_idx}.attn.c_qkv", block.attn.c_qkv, args.svd_rank_qkv))
+#         if args.svd_use_qkv:
+#             out.append((f"blocks.{layer_idx}.attn.c_qkv", block.attn.c_qkv, args.svd_rank_qkv))
     return out
 
 
