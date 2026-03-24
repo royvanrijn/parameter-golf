@@ -730,11 +730,9 @@ def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int,
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
