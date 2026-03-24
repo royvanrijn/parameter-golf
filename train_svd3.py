@@ -29,9 +29,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from svdgpt_artifact import (
     dequantize_state_dict_int8 as dequantize_state_dict_int8_np,
-    export_np_dtype,
     quantize_state_dict_int8 as quantize_state_dict_int8_np,
-    svd_rank_for_name,
 )
 
 # -----------------------------
@@ -99,14 +97,10 @@ class Hyperparameters:
     svd_rank_proj = int(os.environ.get("SVD_RANK_PROJ", 64))
     svd_rank_attn_proj = int(os.environ.get("SVD_RANK_ATTN_PROJ", 64))
     svd_use_attn_proj = bool(int(os.environ.get("SVD_USE_ATTN_PROJ", "1")))
-    # Also SVD-project c_q/c_k/c_v during training and export.
     # This frees artifact bytes (they become low-rank factors instead of full int8 matrices)
     # which can be reinvested in higher MLP ranks.
     svd_use_qkv = bool(int(os.environ.get("SVD_USE_QKV", "1")))
     svd_rank_qkv = int(os.environ.get("SVD_RANK_QKV", os.environ.get("SVD_RANK_QK", "128")))
-    svd_method = os.environ.get("SVD_METHOD", "randomized").lower()
-    svd_power_iters = int(os.environ.get("SVD_POWER_ITERS", 1))
-    svd_oversample = int(os.environ.get("SVD_OVERSAMPLE", 8))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -129,73 +123,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
-
-def low_rank_approx(arr: Tensor, rank: int, args: Hyperparameters, niter: int | None = None) -> Tensor:
-    if args.svd_method == "full":
-        u, s, vh = torch.linalg.svd(arr, full_matrices=False)
-        return (u[:, :rank] * s[:rank]) @ vh[:rank, :]
-
-    power = int(args.svd_power_iters) if niter is None else niter
-    q = min(arr.shape[0], arr.shape[1], rank + max(1, args.svd_oversample))
-    q = max(rank, q)
-    u, s, v = torch.svd_lowrank(arr, q=q, niter=max(0, power))
-    return (u[:, :rank] * s[:rank]) @ v[:, :rank].T
-
-
-def truncated_svd_weight(weight: Tensor, rank: int, args: Hyperparameters, niter: int | None = None) -> tuple[Tensor, float]:
-    out_dim, in_dim = weight.shape
-    max_rank = min(out_dim, in_dim)
-    rank = max(1, min(int(rank), max_rank))
-    if rank >= max_rank:
-        return weight.detach().clone(), 0.0
-    arr = weight.detach().float()
-    low_rank = low_rank_approx(arr, rank, args, niter=niter)
-    residual = float((arr - low_rank).norm() / (arr.norm() + 1e-8))
-    return low_rank.to(dtype=weight.dtype), residual
-
-
-def truncated_svd_factors(
-    weight: Tensor,
-    rank: int,
-    args: Hyperparameters,
-    niter: int | None = None,
-    balanced: bool = True,
-) -> tuple[Tensor, Tensor, float]:
-    arr = weight.detach().float()
-    out_dim, in_dim = arr.shape
-    max_rank = min(out_dim, in_dim)
-    rank = max(1, min(int(rank), max_rank))
-    if rank >= max_rank:
-        if out_dim <= in_dim:
-            a = torch.eye(out_dim, device=arr.device, dtype=arr.dtype)
-            b = arr
-        else:
-            a = arr
-            b = torch.eye(in_dim, device=arr.device, dtype=arr.dtype)
-        return a, b, 0.0
-
-    if args.svd_method == "full":
-        u, s, vh = torch.linalg.svd(arr, full_matrices=False)
-        u, s, vh = u[:, :rank], s[:rank], vh[:rank, :]
-    else:
-        power = int(args.svd_power_iters) if niter is None else niter
-        q = min(arr.shape[0], arr.shape[1], rank + max(1, args.svd_oversample))
-        q = max(rank, q)
-        u, s, v = torch.svd_lowrank(arr, q=q, niter=max(0, power))
-        u, s, vh = u[:, :rank], s[:rank], v[:, :rank].T
-
-    low_rank = (u * s) @ vh
-    residual = float((arr - low_rank).norm() / (arr.norm() + 1e-8))
-    if balanced:
-        sroot = torch.sqrt(torch.clamp(s, min=1e-12))
-        a = u * sroot
-        b = sroot[:, None] * vh
-    else:
-        a = u * s
-        b = vh
-    return a, b, residual
-
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
@@ -527,19 +454,6 @@ class FactorizedLinear(nn.Module):
         self.b.mul_(1.0 / math.sqrt(in_features))
         nn.init.normal_(self.a, mean=0.0, std=1.0 / math.sqrt(rank))
 
-    def set_from_dense_weight(self, weight: Tensor, args: Hyperparameters, niter: int | None = None, balanced: bool = True) -> float:
-        a, b, residual = truncated_svd_factors(weight, self.rank, args, niter=niter, balanced=balanced)
-        self.a.data.copy_(a.to(self.a.dtype).to(self.a.device))
-        self.b.data.copy_(b.to(self.b.dtype).to(self.b.device))
-        return residual
-
-    def init_from_dense_variance(self, weight: Tensor) -> None:
-        target_std = float(weight.detach().float().std())
-        target_std = max(target_std, 1e-8)
-        factor_std = math.sqrt(target_std) / (self.rank ** 0.25)
-        nn.init.normal_(self.a, mean=0.0, std=factor_std)
-        nn.init.normal_(self.b, mean=0.0, std=factor_std)
-
     def forward(self, x: Tensor) -> Tensor:
         orig_shape = x.shape[:-1]
         x2 = x.reshape(-1, x.shape[-1])
@@ -820,7 +734,6 @@ def convert_model_to_factorized(model: GPT, args: Hyperparameters) -> tuple[int,
             bias=dense.bias is not None,
         ).to(device=dense.weight.device, dtype=dense.weight.dtype)
         target_std = float(dense.weight.detach().float().std())
-        fact.init_from_dense_variance(dense.weight)
         if dense.bias is not None and fact.bias is not None:
             fact.bias.data.copy_(dense.bias.detach().float())
         set_module_by_name(model, name, fact)
@@ -1022,8 +935,6 @@ def main() -> None:
         f"rank_fc={args.svd_rank_fc} rank_proj={args.svd_rank_proj} "
         f"rank_attn_proj={args.svd_rank_attn_proj} use_attn_proj={args.svd_use_attn_proj} "
         f"use_qkv={args.svd_use_qkv} rank_qkv={args.svd_rank_qkv} "
-        f"method={args.svd_method} power_iters={args.svd_power_iters} "
-        f"oversample={args.svd_oversample} "
     )
     log0(f"compile_model:{args.compile_model} compile_fullgraph:{args.compile_fullgraph}")
     log0(f"factorized_init converted_layers:{converted} avg_dense_weight_std:{avg_target_std:.4f}")
@@ -1095,8 +1006,7 @@ def main() -> None:
     # warmdown schedule isn't thrown off by the growing per-step SVD overhead.
     stable_step_ms: float | None = None
 
-    first_svd_start = 300
-    STABLE_STEP_CAPTURE = max(100, min(300, first_svd_start - 20))
+    STABLE_STEP_CAPTURE = 100
 
     for step in range(args.iterations + 1):
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
