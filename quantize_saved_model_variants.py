@@ -189,7 +189,19 @@ def main() -> None:
     if args.roundtrip_val_bpb:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         hp, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_eval_context(device)
-        model = GPT(hp).to(device)
+        model = GPT(
+            vocab_size=hp.vocab_size,
+            num_layers=hp.num_layers,
+            model_dim=hp.model_dim,
+            num_heads=hp.num_heads,
+            num_kv_heads=hp.num_kv_heads,
+            mlp_mult=hp.mlp_mult,
+            tie_embeddings=hp.tie_embeddings,
+            tied_embed_init_std=hp.tied_embed_init_std,
+            logit_softcap=hp.logit_softcap,
+            rope_base=hp.rope_base,
+            qk_gain_init=hp.qk_gain_init,
+        ).to(device)
         model.load_state_dict(state_dict, strict=True)
         fp_val_loss, fp_val_bpb = eval_val_metrics(
             hp,
