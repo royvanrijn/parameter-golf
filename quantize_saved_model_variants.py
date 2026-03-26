@@ -15,6 +15,11 @@ from pathlib import Path
 import sentencepiece as spm
 import torch
 
+try:
+    import zstandard as zstd
+except ImportError:
+    zstd = None
+
 from train_gpt_comp import (
     GPT,
     Hyperparameters,
@@ -198,6 +203,8 @@ def run_variants(
     state_dict: dict[str, torch.Tensor],
     output_dir: Path,
     validate_roundtrip: bool,
+    codec: str,
+    codec_level: int,
     code_size_bytes: int = 0,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -235,9 +242,14 @@ def run_variants(
         raw_buf = io.BytesIO()
         torch.save(quant_obj, raw_buf)
         raw_bytes = len(raw_buf.getvalue())
-        blob = zlib.compress(raw_buf.getvalue(), level=9)
+        if codec == "zstd":
+            if zstd is None:
+                raise RuntimeError("--codec=zstd requested but zstandard is not installed")
+            blob = zstd.ZstdCompressor(level=codec_level).compress(raw_buf.getvalue())
+        else:
+            blob = zlib.compress(raw_buf.getvalue(), level=max(1, min(codec_level, 9)))
 
-        out_path = output_dir / f"{method_name}.ptz"
+        out_path = output_dir / f"{method_name}.{codec}"
         out_path.write_bytes(blob)
 
         contest_bytes = len(blob)
@@ -258,7 +270,8 @@ def run_variants(
         )
 
         if validate_roundtrip:
-            roundtrip_obj = torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu")
+            raw = zstd.ZstdDecompressor().decompress(blob) if codec == "zstd" else zlib.decompress(blob)
+            roundtrip_obj = torch.load(io.BytesIO(raw), map_location="cpu")
             roundtrip_state = dequantize_state_dict_nonlinear(roundtrip_obj)
             if set(roundtrip_state.keys()) != set(state_dict.keys()):
                 raise RuntimeError(f"Roundtrip mismatch for {method_name}: key sets differ")
@@ -286,6 +299,8 @@ def main() -> None:
         default=8,
         help="Max validation batches for --roundtrip-val-bpb (0 means full validation)",
     )
+    parser.add_argument("--codec", choices=("zlib", "zstd"), default="zlib", help="Artifact compression codec")
+    parser.add_argument("--codec-level", type=int, default=9, help="Compression level (zlib:1-9, zstd:1-22)")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -300,6 +315,8 @@ def main() -> None:
         state_dict,
         args.output_dir,
         validate_roundtrip=args.validate_roundtrip,
+        codec=args.codec,
+        codec_level=args.codec_level,
         code_size_bytes=code_size_bytes,
     )
 
@@ -333,8 +350,9 @@ def main() -> None:
             cfg = method_cfgs.get(method_name)
             if cfg is None:
                 continue
-            artifact = (args.output_dir / f"{method_name}.ptz").read_bytes()
-            roundtrip_obj = torch.load(io.BytesIO(zlib.decompress(artifact)), map_location="cpu")
+            artifact = (args.output_dir / f"{method_name}.{args.codec}").read_bytes()
+            raw = zstd.ZstdDecompressor().decompress(artifact) if args.codec == "zstd" else zlib.decompress(artifact)
+            roundtrip_obj = torch.load(io.BytesIO(raw), map_location="cpu")
             roundtrip_state = dequantize_state_dict_nonlinear(roundtrip_obj)
             model.load_state_dict(roundtrip_state, strict=True)
             q_val_loss, q_val_bpb = eval_val_metrics(
