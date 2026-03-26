@@ -52,7 +52,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -983,9 +983,13 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    def qat_alpha(step: int) -> float:
-        denom = max(args.iterations - 1, 1)
-        progress = min(max(step / denom, 0.0), 1.0)
+    def qat_alpha(step: int, elapsed_ms: float) -> float:
+        # Prefer wallclock when available, fall back to iterations otherwise.
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            progress = min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
+        else:
+            denom = max(args.iterations - 1, 1)
+            progress = min(max(step / denom, 0.0), 1.0)
         return progress ** args.qat_alpha_power
 
     @torch.no_grad()
@@ -1017,7 +1021,7 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
-            set_model_qat_alpha(qat_alpha(warmup_step))
+            set_model_qat_alpha(0.0)
             refresh_model_qat_cache()
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1087,9 +1091,17 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        alpha = qat_alpha(step)
+
+        # Optional small headroom so you hit ~1.0 before the cap.
+        qat_target_ms = max_wallclock_ms * 0.98 if max_wallclock_ms is not None else None
+        alpha_elapsed_ms = elapsed_ms
+        if qat_target_ms is not None:
+            alpha_elapsed_ms = min(elapsed_ms * (max_wallclock_ms / max(qat_target_ms, 1e-9)), max_wallclock_ms)
+
+        alpha = qat_alpha(step, alpha_elapsed_ms)
         set_model_qat_alpha(alpha)
         refresh_model_qat_cache()
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
