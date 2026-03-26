@@ -29,6 +29,94 @@ from train_gpt_comp import (
 )
 
 
+def _find_first_matching_key(state_dict: dict[str, torch.Tensor], suffix: str) -> str | None:
+    for name in state_dict:
+        if name.endswith(suffix):
+            return name
+    return None
+
+
+def infer_model_kwargs_from_state_dict(
+    state_dict: dict[str, torch.Tensor], defaults: Hyperparameters
+) -> dict[str, int | float | bool]:
+    tok_emb = state_dict.get("tok_emb.weight")
+    if tok_emb is None or tok_emb.ndim != 2:
+        raise ValueError("Checkpoint is missing required tensor 'tok_emb.weight'")
+    vocab_size, model_dim = int(tok_emb.shape[0]), int(tok_emb.shape[1])
+
+    block_ids: list[int] = []
+    for key in state_dict:
+        if not key.startswith("blocks."):
+            continue
+        parts = key.split(".", 2)
+        if len(parts) < 3:
+            continue
+        try:
+            block_ids.append(int(parts[1]))
+        except ValueError:
+            continue
+    if not block_ids:
+        raise ValueError("Could not infer num_layers: checkpoint has no 'blocks.<idx>.*' tensors")
+    num_layers = max(block_ids) + 1
+
+    q_gain_key = _find_first_matching_key(state_dict, ".attn.q_gain")
+    if q_gain_key is None:
+        raise ValueError("Could not infer num_heads: checkpoint has no '*.attn.q_gain' tensor")
+    q_gain = state_dict[q_gain_key]
+    if q_gain.ndim != 1:
+        raise ValueError(f"Expected {q_gain_key} to be 1D, got shape={tuple(q_gain.shape)}")
+    num_heads = int(q_gain.shape[0])
+    if num_heads <= 0:
+        raise ValueError("Inferred num_heads must be positive")
+    if model_dim % num_heads != 0:
+        raise ValueError(
+            f"Cannot infer head_dim cleanly: model_dim={model_dim} not divisible by num_heads={num_heads}"
+        )
+    head_dim = model_dim // num_heads
+
+    c_k_key = _find_first_matching_key(state_dict, ".attn.c_k.weight")
+    if c_k_key is None:
+        raise ValueError("Could not infer num_kv_heads: checkpoint has no '*.attn.c_k.weight' tensor")
+    c_k_weight = state_dict[c_k_key]
+    if c_k_weight.ndim != 2:
+        raise ValueError(f"Expected {c_k_key} to be 2D, got shape={tuple(c_k_weight.shape)}")
+    if int(c_k_weight.shape[0]) % head_dim != 0:
+        raise ValueError(
+            f"Cannot infer num_kv_heads: {c_k_key} out_features={int(c_k_weight.shape[0])} "
+            f"not divisible by head_dim={head_dim}"
+        )
+    num_kv_heads = int(c_k_weight.shape[0]) // head_dim
+
+    mlp_fc_key = _find_first_matching_key(state_dict, ".mlp.fc.weight")
+    if mlp_fc_key is None:
+        raise ValueError("Could not infer mlp_mult: checkpoint has no '*.mlp.fc.weight' tensor")
+    mlp_fc = state_dict[mlp_fc_key]
+    if mlp_fc.ndim != 2:
+        raise ValueError(f"Expected {mlp_fc_key} to be 2D, got shape={tuple(mlp_fc.shape)}")
+    if int(mlp_fc.shape[0]) % model_dim != 0:
+        raise ValueError(
+            f"Cannot infer mlp_mult: {mlp_fc_key} out_features={int(mlp_fc.shape[0])} "
+            f"not divisible by model_dim={model_dim}"
+        )
+    mlp_mult = int(mlp_fc.shape[0]) // model_dim
+
+    tie_embeddings = "lm_head.weight" not in state_dict
+
+    return {
+        "vocab_size": vocab_size,
+        "num_layers": num_layers,
+        "model_dim": model_dim,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "mlp_mult": mlp_mult,
+        "tie_embeddings": tie_embeddings,
+        "tied_embed_init_std": float(defaults.tied_embed_init_std),
+        "logit_softcap": float(defaults.logit_softcap),
+        "rope_base": float(defaults.rope_base),
+        "qk_gain_init": float(defaults.qk_gain_init),
+    }
+
+
 def load_state_dict(path: Path) -> dict[str, torch.Tensor]:
     obj = torch.load(path, map_location="cpu")
     if isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
@@ -189,19 +277,15 @@ def main() -> None:
     if args.roundtrip_val_bpb:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         hp, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_eval_context(device)
-        model = GPT(
-            vocab_size=hp.vocab_size,
-            num_layers=hp.num_layers,
-            model_dim=hp.model_dim,
-            num_heads=hp.num_heads,
-            num_kv_heads=hp.num_kv_heads,
-            mlp_mult=hp.mlp_mult,
-            tie_embeddings=hp.tie_embeddings,
-            tied_embed_init_std=hp.tied_embed_init_std,
-            logit_softcap=hp.logit_softcap,
-            rope_base=hp.rope_base,
-            qk_gain_init=hp.qk_gain_init,
-        ).to(device)
+        model_kwargs = infer_model_kwargs_from_state_dict(state_dict, hp)
+        print(
+            "[info] inferred checkpoint model config "
+            f"(vocab={model_kwargs['vocab_size']}, layers={model_kwargs['num_layers']}, "
+            f"dim={model_kwargs['model_dim']}, heads={model_kwargs['num_heads']}, "
+            f"kv_heads={model_kwargs['num_kv_heads']}, mlp_mult={model_kwargs['mlp_mult']}, "
+            f"tie_embeddings={model_kwargs['tie_embeddings']})"
+        )
+        model = GPT(**model_kwargs).to(device)
         model.load_state_dict(state_dict, strict=True)
         fp_val_loss, fp_val_bpb = eval_val_metrics(
             hp,
