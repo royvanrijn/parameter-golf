@@ -284,10 +284,29 @@ def eval_val(
 INT6_MAX_Q = 31.0
 
 def quantize_dequantize_int6(t: Tensor) -> Tensor:
+    # Symmetric int6 fake-quant:
+    # - per-column linear clipping/scaling for 2D tensors
+    # - per-tensor linear clipping/scaling for vectors/scalars
     t32 = t.float()
-    max_abs = t32.abs().amax()
-    scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
-    q = torch.clamp(torch.round(t32 / scale), -INT6_MAX_Q, INT6_MAX_Q)
+    if t32.ndim == 2:
+        clip_abs = (
+            torch.quantile(t32.abs(), INT6_CLIP_Q, dim=0)
+            if t32.numel()
+            else torch.empty((t32.shape[1],), dtype=torch.float32, device=t32.device)
+        ).clamp_min(1e-12)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[None, :]), -clip_abs[None, :])
+        scale = (clip_abs / INT6_MAX_Q).clamp_min(1.0 / INT6_MAX_Q)
+        q = torch.clamp(torch.round(clipped / scale[None, :]), -INT6_MAX_Q, INT6_MAX_Q)
+        return (q * scale[None, :]).to(dtype=t.dtype)
+
+    clip_abs = (
+        torch.quantile(t32.abs().flatten(), INT6_CLIP_Q)
+        if t32.numel()
+        else torch.tensor(0.0, device=t32.device)
+    )
+    clip_abs = clip_abs.clamp_min(1e-12)
+    scale = torch.clamp(clip_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX_Q, INT6_MAX_Q)
     return (q * scale).to(dtype=t.dtype)
 
 # -----------------------------
@@ -540,14 +559,9 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         w = self.weight.to(x.dtype)
-
-        if self._cached_qweight is None or not self._cache_valid:
-            wq = quantize_dequantize_int6(self.weight.detach()).to(dtype=x.dtype)
-        else:
-            wq = self._cached_qweight.to(dtype=x.dtype)
-
-        alpha = self.qat_alpha.to(dtype=x.dtype)
-        w_eff = w + (wq - w).detach() * alpha
+        wq = quantize_dequantize_int6(w)
+        alpha = self.qat_alpha.to(device=x.device, dtype=x.dtype)
+        w_eff = w + alpha * (wq - w)
         return F.linear(x, w_eff, bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
