@@ -571,20 +571,14 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         w = self.weight.to(x.dtype)
 
-        alpha = float(self.qat_alpha.item())
-        if alpha <= 0.0:
-            return F.linear(x, w, bias)
-
         if self._cached_qweight is None or not self._cache_valid:
-            # fallback for eval / missed refresh
-            wq = quantize_dequantize_int6(self.weight).to(dtype=x.dtype)
+            wq = quantize_dequantize_int6(self.weight.detach()).to(dtype=x.dtype)
         else:
             wq = self._cached_qweight.to(dtype=x.dtype)
 
-        # STE-style fake quant
-        w_eff = w + alpha * (wq - w).detach()
+        alpha = self.qat_alpha.to(dtype=x.dtype)
+        w_eff = w + (wq - w).detach() * alpha
         return F.linear(x, w_eff, bias)
-
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
