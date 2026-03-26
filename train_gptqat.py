@@ -284,12 +284,7 @@ def eval_val(
 INT6_MAX_Q = 31.0
 QAT_GROUP_SIZE = int(os.environ.get("QAT_GROUP_SIZE", 32))
 
-
 def quantize_dequantize_int6(t: Tensor) -> Tensor:
-    # Fast fake-quant:
-    # - 2D tensors: grouped per-column amax scaling
-    # - 1D/scalars: per-tensor amax scaling
-    # Much cheaper than per-column percentile quantile.
     t32 = t.float()
 
     if t32.ndim == 2:
@@ -305,7 +300,7 @@ def quantize_dequantize_int6(t: Tensor) -> Tensor:
         groups = cols_padded // g
         tg = tpad.view(rows, groups, g)
 
-        # one scale per column-group
+        # grouped per-col-ish linear amax scaling
         max_abs = tg.abs().amax(dim=(0, 2), keepdim=True)
         scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
 
