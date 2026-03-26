@@ -381,14 +381,34 @@ LOG_COMPAND_MU = float(os.environ.get("LOG_COMPAND_MU", 50.0))
 QUANT_BENCHMARK = bool(int(os.environ.get("QUANT_BENCHMARK", "1")))
 QUANT_BENCHMARK_MAX_BATCHES = int(os.environ.get("QUANT_BENCHMARK_MAX_BATCHES", 8))
 
+# DEFAULT_QUANT_BENCHMARK_METHODS = (
+#     "linear_int6_per_tensor",
+#     "sin_int6_per_tensor",
+#     "log_int6_per_tensor",
+#     "linear_int6_per_row",
+#     "sin_int6_per_row",
+#     "log_int6_per_row",
+#     "linear_int6_per_col",
+#     "sin_int6_per_col",
+#     "log_int6_per_col",
+# )
+
 DEFAULT_QUANT_BENCHMARK_METHODS = (
-    "linear_int6_per_tensor",
-    "sin_int6_per_tensor",
-    "log_int6_per_tensor",
-    "linear_int6_per_row",
-    "sin_int6_per_row",
-    "log_int6_per_row",
+    # baseline
     "linear_int6_per_col",
+
+    # your new mixed ones (priority)
+    "mix_q_only_int8_rest_int6_col",
+    "mix_qk_int8_rest_int6_col",
+    "mix_attn_proj_int8_rest_int6_col",
+    "mix_mlp_proj_int8_rest_int6_col",
+    "mix_proj_only_int8_rest_int6_col",
+    "mix_kv_only_int8_rest_int6_col",
+    "mix_qv_only_int8_rest_int6_col",
+    "mix_last_block_proj_int8_rest_int6_col",
+    "mix_last2_block_proj_int8_rest_int6_col",
+
+    # optionally keep a few refs
     "sin_int6_per_col",
     "log_int6_per_col",
 )
@@ -415,6 +435,86 @@ def quant_benchmark_method_cfgs() -> dict[str, dict[str, object]]:
         "linear_int6_per_col": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_col"),
         "sin_int6_per_col": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_col"),
         "log_int6_per_col": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_col"),
+
+        "mix_q_only_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.c_q", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_qk_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.c_q", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("attn.c_k", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_attn_proj_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_mlp_proj_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("mlp.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_proj_only_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("mlp.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_kv_only_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.c_k", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("attn.c_v", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_qv_only_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("attn.c_q", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("attn.c_v", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_last_block_proj_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("blocks.11.attn.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("blocks.11.mlp.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
+
+        "mix_last2_block_proj_int8_rest_int6_col": dict(
+            kind="mixed",
+            default=dict(bits=6, nonlinear="linear", granularity="per_col"),
+            overrides=(
+                ("blocks.10.attn.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("blocks.10.mlp.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("blocks.11.attn.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+                ("blocks.11.mlp.proj", dict(bits=8, nonlinear="linear", granularity="per_col")),
+            ),
+        ),
     }
 
 def tensor_nbytes(t: Tensor) -> int:
