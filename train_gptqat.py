@@ -282,27 +282,42 @@ def eval_val(
 
 
 INT6_MAX_Q = 31.0
+QAT_GROUP_SIZE = int(os.environ.get("QAT_GROUP_SIZE", 32))
 
 
 def quantize_dequantize_int6(t: Tensor) -> Tensor:
-    # Symmetric int6 fake-quant that mirrors post-training quantization:
-    # - per-column percentile clipping/scaling for 2D tensors
-    # - per-tensor percentile clipping/scaling for vectors/scalars
+    # Fast fake-quant:
+    # - 2D tensors: grouped per-column amax scaling
+    # - 1D/scalars: per-tensor amax scaling
+    # Much cheaper than per-column percentile quantile.
     t32 = t.float()
-    if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT6_CLIP_Q, dim=0)
-            if t32.numel()
-            else torch.empty((t32.shape[1],), dtype=torch.float32, device=t32.device)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[None, :]), -clip_abs[None, :])
-        scale = (clip_abs / INT6_MAX_Q).clamp_min(1.0 / INT6_MAX_Q)
-        q = torch.clamp(torch.round(clipped / scale[None, :]), -INT6_MAX_Q, INT6_MAX_Q)
-        return (q * scale[None, :]).to(dtype=t.dtype)
 
-    clip_abs = torch.quantile(t32.abs().flatten(), INT6_CLIP_Q) if t32.numel() else torch.tensor(0.0, device=t32.device)
-    scale = torch.clamp(clip_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX_Q, INT6_MAX_Q)
+    if t32.ndim == 2:
+        rows, cols = t32.shape
+        g = max(1, min(QAT_GROUP_SIZE, cols))
+        pad = (g - (cols % g)) % g
+        if pad:
+            tpad = F.pad(t32, (0, pad))
+        else:
+            tpad = t32
+
+        cols_padded = tpad.shape[1]
+        groups = cols_padded // g
+        tg = tpad.view(rows, groups, g)
+
+        # one scale per column-group
+        max_abs = tg.abs().amax(dim=(0, 2), keepdim=True)
+        scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
+
+        q = torch.clamp(torch.round(tg / scale), -INT6_MAX_Q, INT6_MAX_Q)
+        dq = (q * scale).view(rows, cols_padded)
+        if pad:
+            dq = dq[:, :cols]
+        return dq.to(dtype=t.dtype)
+
+    max_abs = t32.abs().amax()
+    scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
+    q = torch.clamp(torch.round(t32 / scale), -INT6_MAX_Q, INT6_MAX_Q)
     return (q * scale).to(dtype=t.dtype)
 
 # -----------------------------
@@ -535,17 +550,39 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__(in_features, out_features, bias=bias)
         self.register_buffer("qat_alpha", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self._cached_qweight: Tensor | None = None
+        self._cache_valid = False
+
+    @torch.no_grad()
+    def refresh_qat_cache(self) -> None:
+        w = self.weight.detach()
+        self._cached_qweight = quantize_dequantize_int6(w).contiguous()
+        self._cache_valid = True
+
+    @torch.no_grad()
+    def invalidate_qat_cache(self) -> None:
+        self._cached_qweight = None
+        self._cache_valid = False
 
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         w = self.weight.to(x.dtype)
-        wq = quantize_dequantize_int6(w)
-        alpha = self.qat_alpha.to(device=x.device, dtype=x.dtype)
-        w_eff = w + alpha * (wq - w)
+
+        alpha = float(self.qat_alpha.item())
+        if alpha <= 0.0:
+            return F.linear(x, w, bias)
+
+        if self._cached_qweight is None or not self._cache_valid:
+            # fallback for eval / missed refresh
+            wq = quantize_dequantize_int6(self.weight).to(dtype=x.dtype)
+        else:
+            wq = self._cached_qweight.to(dtype=x.dtype)
+
+        # STE-style fake quant
+        w_eff = w + alpha * (wq - w).detach()
         return F.linear(x, w_eff, bias)
 
 
@@ -984,6 +1021,16 @@ def main() -> None:
             module.qat_alpha.fill_(alpha)
 
     @torch.no_grad()
+    def refresh_model_qat_cache() -> None:
+        for module in casted_linear_modules:
+            module.refresh_qat_cache()
+
+    @torch.no_grad()
+    def invalidate_model_qat_cache() -> None:
+        for module in casted_linear_modules:
+            module.invalidate_qat_cache()
+
+    @torch.no_grad()
     def apply_matrix_snap(alpha: float) -> None:
         if not args.qat_enable_snap:
             return
@@ -998,6 +1045,7 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             set_model_qat_alpha(qat_alpha(warmup_step))
+            refresh_model_qat_cache()
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1067,6 +1115,7 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         alpha = qat_alpha(step)
         set_model_qat_alpha(alpha)
+        refresh_model_qat_cache()
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1093,6 +1142,7 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         apply_matrix_snap(alpha)
+        invalidate_model_qat_cache()
         zero_grad_all()
 
         step += 1
