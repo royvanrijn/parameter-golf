@@ -285,11 +285,24 @@ INT6_MAX_Q = 31.0
 
 
 def quantize_dequantize_int6(t: Tensor) -> Tensor:
-    # Symmetric int6 fake-quant with one scale per tensor for low overhead.
+    # Symmetric int6 fake-quant that mirrors post-training quantization:
+    # - per-column percentile clipping/scaling for 2D tensors
+    # - per-tensor percentile clipping/scaling for vectors/scalars
     t32 = t.float()
-    max_abs = t32.abs().amax()
-    scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
-    q = torch.clamp(torch.round(t32 / scale), -INT6_MAX_Q, INT6_MAX_Q)
+    if t32.ndim == 2:
+        clip_abs = (
+            torch.quantile(t32.abs(), INT6_CLIP_Q, dim=0)
+            if t32.numel()
+            else torch.empty((t32.shape[1],), dtype=torch.float32, device=t32.device)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[None, :]), -clip_abs[None, :])
+        scale = (clip_abs / INT6_MAX_Q).clamp_min(1.0 / INT6_MAX_Q)
+        q = torch.clamp(torch.round(clipped / scale[None, :]), -INT6_MAX_Q, INT6_MAX_Q)
+        return (q * scale[None, :]).to(dtype=t.dtype)
+
+    clip_abs = torch.quantile(t32.abs().flatten(), INT6_CLIP_Q) if t32.numel() else torch.tensor(0.0, device=t32.device)
+    scale = torch.clamp(clip_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT6_MAX_Q, INT6_MAX_Q)
     return (q * scale).to(dtype=t.dtype)
 
 # -----------------------------
