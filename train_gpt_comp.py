@@ -382,19 +382,15 @@ QUANT_BENCHMARK = bool(int(os.environ.get("QUANT_BENCHMARK", "1")))
 QUANT_BENCHMARK_MAX_BATCHES = int(os.environ.get("QUANT_BENCHMARK_MAX_BATCHES", 8))
 
 DEFAULT_QUANT_BENCHMARK_METHODS = (
-    "linear_int8_per_row",
-    "sin_int8_per_row",
-    "log_int8_per_row",
-    "linear_int6_per_row",
-    "linear_int6_per_col",
-    "log_int6_per_row",
-    "sin_int6_per_row",
     "linear_int6_per_tensor",
-    "linear_int8_per_tensor",
-    "linear_int8_per_col",
-    "mix_embed_head_int8_proj_int6_linear",
-    "mix_embed_head_int8_proj_int6_log",
-    "mix_embed_head_int8_proj_int6_col",
+    "sin_int6_per_tensor",
+    "log_int6_per_tensor",
+    "linear_int6_per_row",
+    "sin_int6_per_row",
+    "log_int6_per_row",
+    "linear_int6_per_col",
+    "sin_int6_per_col",
+    "log_int6_per_col",
 )
 
 def parse_quant_benchmark_methods() -> tuple[str, ...]:
@@ -405,46 +401,20 @@ def parse_quant_benchmark_methods() -> tuple[str, ...]:
 
 def quant_benchmark_method_cfgs() -> dict[str, dict[str, object]]:
     return {
-        "linear_int8_per_row": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_row"),
-        "sin_int8_per_row": dict(kind="uniform", bits=8, nonlinear="sin", granularity="per_row"),
-        "log_int8_per_row": dict(kind="uniform", bits=8, nonlinear="log", granularity="per_row"),
-        "linear_int6_per_row": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_row"),
-        "linear_int6_per_col": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_col"),
-        "log_int6_per_row": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_row"),
-        "sin_int6_per_row": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_row"),
+        # per-tensor
         "linear_int6_per_tensor": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_tensor"),
-        "linear_int8_per_tensor": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_tensor"),
-        "linear_int8_per_col": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_col"),
-        "mix_embed_head_int8_proj_int6_linear": dict(
-            kind="mixed",
-            default=dict(bits=8, nonlinear="linear", granularity="per_row"),
-            overrides=(
-                ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("attn.", dict(bits=6, nonlinear="linear", granularity="per_row")),
-                ("mlp.", dict(bits=6, nonlinear="linear", granularity="per_row")),
-            ),
-        ),
-        "mix_embed_head_int8_proj_int6_log": dict(
-            kind="mixed",
-            default=dict(bits=8, nonlinear="linear", granularity="per_row"),
-            overrides=(
-                ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("attn.", dict(bits=6, nonlinear="log", granularity="per_row")),
-                ("mlp.", dict(bits=6, nonlinear="log", granularity="per_row")),
-            ),
-        ),
-        "mix_embed_head_int8_proj_int6_col": dict(
-            kind="mixed",
-            default=dict(bits=8, nonlinear="linear", granularity="per_row"),
-            overrides=(
-                ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
-                ("attn.", dict(bits=6, nonlinear="linear", granularity="per_col")),
-                ("mlp.", dict(bits=6, nonlinear="linear", granularity="per_col")),
-            ),
-        ),
+        "sin_int6_per_tensor": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_tensor"),
+        "log_int6_per_tensor": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_tensor"),
+
+        # per-row
+        "linear_int6_per_row": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_row"),
+        "sin_int6_per_row": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_row"),
+        "log_int6_per_row": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_row"),
+
+        # per-col
+        "linear_int6_per_col": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_col"),
+        "sin_int6_per_col": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_col"),
+        "log_int6_per_col": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_col"),
     }
 
 def tensor_nbytes(t: Tensor) -> int:

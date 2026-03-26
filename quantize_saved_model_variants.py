@@ -3,9 +3,9 @@
 Example:
     python quantize_saved_model_variants.py --input final_model.pt --output-dir quant_variants
 """
-
 from __future__ import annotations
 
+import inspect
 import argparse
 import io
 import math
@@ -194,7 +194,12 @@ def build_eval_context(device: torch.device) -> tuple[Hyperparameters, torch.Ten
     return args, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
 
 
-def run_variants(state_dict: dict[str, torch.Tensor], output_dir: Path, validate_roundtrip: bool) -> None:
+def run_variants(
+    state_dict: dict[str, torch.Tensor],
+    output_dir: Path,
+    validate_roundtrip: bool,
+    code_size_bytes: int = 0,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     method_cfgs = quant_benchmark_method_cfgs()
     method_names = parse_quant_benchmark_methods()
@@ -207,7 +212,7 @@ def run_variants(state_dict: dict[str, torch.Tensor], output_dir: Path, validate
             continue
 
         if cfg.get("kind") == "mixed":
-            quant_obj, _ = quantize_state_dict_nonlinear_mixed(
+            quant_obj, quant_stats = quantize_state_dict_nonlinear_mixed(
                 state_dict,
                 default_cfg=dict(cfg["default"]),
                 overrides=tuple(cfg["overrides"]),
@@ -215,7 +220,7 @@ def run_variants(state_dict: dict[str, torch.Tensor], output_dir: Path, validate
             )
             cfg_desc = "mixed"
         else:
-            quant_obj, _ = quantize_state_dict_nonlinear(
+            quant_obj, quant_stats = quantize_state_dict_nonlinear(
                 state_dict,
                 bits=int(cfg["bits"]),
                 nonlinear=str(cfg["nonlinear"]),
@@ -229,19 +234,37 @@ def run_variants(state_dict: dict[str, torch.Tensor], output_dir: Path, validate
 
         raw_buf = io.BytesIO()
         torch.save(quant_obj, raw_buf)
+        raw_bytes = len(raw_buf.getvalue())
         blob = zlib.compress(raw_buf.getvalue(), level=9)
+
         out_path = output_dir / f"{method_name}.ptz"
         out_path.write_bytes(blob)
 
-        line = f"[ok] {method_name:36s} bytes={len(blob):9d} cfg={cfg_desc}"
+        contest_bytes = len(blob)
+        payload_bytes = int(
+            quant_stats.get("int8_payload_bytes")
+            or quant_stats.get("int6_payload_bytes")
+            or 0
+        )
+        total_submission_bytes = contest_bytes + code_size_bytes
+
+
+        line = (
+            f"[ok] {method_name:36s} "
+            f"contest_bytes={contest_bytes:9d} "
+            f"(payload:{payload_bytes} raw_torch:{raw_bytes}) "
+            f"total_submission_bytes={total_submission_bytes:9d} "
+            f"cfg={cfg_desc}"
+        )
+
         if validate_roundtrip:
             roundtrip_obj = torch.load(io.BytesIO(zlib.decompress(blob)), map_location="cpu")
             roundtrip_state = dequantize_state_dict_nonlinear(roundtrip_obj)
             if set(roundtrip_state.keys()) != set(state_dict.keys()):
                 raise RuntimeError(f"Roundtrip mismatch for {method_name}: key sets differ")
             line += " roundtrip=pass"
-        print(line)
 
+        print(line)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -272,7 +295,13 @@ def main() -> None:
         )
 
     state_dict = load_state_dict(args.input)
-    run_variants(state_dict, args.output_dir, validate_roundtrip=args.validate_roundtrip)
+    code_size_bytes = len(Path(__file__).read_bytes())
+    run_variants(
+        state_dict,
+        args.output_dir,
+        validate_roundtrip=args.validate_roundtrip,
+        code_size_bytes=code_size_bytes,
+    )
 
     if args.roundtrip_val_bpb:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
