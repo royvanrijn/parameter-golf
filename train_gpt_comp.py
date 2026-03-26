@@ -385,9 +385,16 @@ DEFAULT_QUANT_BENCHMARK_METHODS = (
     "linear_int8_per_row",
     "sin_int8_per_row",
     "log_int8_per_row",
+    "linear_int6_per_row",
+    "linear_int6_per_col",
+    "log_int6_per_row",
     "sin_int6_per_row",
+    "linear_int6_per_tensor",
     "linear_int8_per_tensor",
     "linear_int8_per_col",
+    "mix_embed_head_int8_proj_int6_linear",
+    "mix_embed_head_int8_proj_int6_log",
+    "mix_embed_head_int8_proj_int6_col",
 )
 
 def parse_quant_benchmark_methods() -> tuple[str, ...]:
@@ -721,6 +728,70 @@ def quantize_state_dict_nonlinear(
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
+
+def quantize_state_dict_nonlinear_mixed(
+    state_dict: dict[str, Tensor],
+    default_cfg: dict[str, object],
+    overrides: tuple[tuple[str, dict[str, object]], ...],
+    mu: float = LOG_COMPAND_MU,
+):
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        cfg = default_cfg
+        for pattern, override_cfg in overrides:
+            if pattern in name:
+                cfg = override_cfg
+                break
+        bits = int(cfg["bits"])
+        nonlinear = str(cfg["nonlinear"])
+        granularity = str(cfg["granularity"])
+        q, s = quantize_float_tensor_nonlinear(t, bits=bits, nonlinear=nonlinear, granularity=granularity, mu=mu)
+        qmeta[name] = {"bits": bits, "nonlinear": nonlinear, "granularity": granularity}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    obj: dict[str, object] = {
+        "__quant_format__": "intN_nonlinear_compand_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+        "qmeta": qmeta,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
 
 def dequantize_state_dict_nonlinear(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -1527,12 +1598,46 @@ def main() -> None:
 
     if QUANT_BENCHMARK:
         method_cfgs = {
-            "linear_int8_per_row": dict(bits=8, nonlinear="linear", granularity="per_row"),
-            "sin_int8_per_row": dict(bits=8, nonlinear="sin", granularity="per_row"),
-            "log_int8_per_row": dict(bits=8, nonlinear="log", granularity="per_row"),
-            "sin_int6_per_row": dict(bits=6, nonlinear="sin", granularity="per_row"),
-            "linear_int8_per_tensor": dict(bits=8, nonlinear="linear", granularity="per_tensor"),
-            "linear_int8_per_col": dict(bits=8, nonlinear="linear", granularity="per_col"),
+            "linear_int8_per_row": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_row"),
+            "sin_int8_per_row": dict(kind="uniform", bits=8, nonlinear="sin", granularity="per_row"),
+            "log_int8_per_row": dict(kind="uniform", bits=8, nonlinear="log", granularity="per_row"),
+            "linear_int6_per_row": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_row"),
+            "linear_int6_per_col": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_col"),
+            "log_int6_per_row": dict(kind="uniform", bits=6, nonlinear="log", granularity="per_row"),
+            "sin_int6_per_row": dict(kind="uniform", bits=6, nonlinear="sin", granularity="per_row"),
+            "linear_int6_per_tensor": dict(kind="uniform", bits=6, nonlinear="linear", granularity="per_tensor"),
+            "linear_int8_per_tensor": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_tensor"),
+            "linear_int8_per_col": dict(kind="uniform", bits=8, nonlinear="linear", granularity="per_col"),
+            "mix_embed_head_int8_proj_int6_linear": dict(
+                kind="mixed",
+                default=dict(bits=8, nonlinear="linear", granularity="per_row"),
+                overrides=(
+                    ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("attn.", dict(bits=6, nonlinear="linear", granularity="per_row")),
+                    ("mlp.", dict(bits=6, nonlinear="linear", granularity="per_row")),
+                ),
+            ),
+            "mix_embed_head_int8_proj_int6_log": dict(
+                kind="mixed",
+                default=dict(bits=8, nonlinear="linear", granularity="per_row"),
+                overrides=(
+                    ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("attn.", dict(bits=6, nonlinear="log", granularity="per_row")),
+                    ("mlp.", dict(bits=6, nonlinear="log", granularity="per_row")),
+                ),
+            ),
+            "mix_embed_head_int8_proj_int6_col": dict(
+                kind="mixed",
+                default=dict(bits=8, nonlinear="linear", granularity="per_row"),
+                overrides=(
+                    ("tok_emb.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("lm_head.weight", dict(bits=8, nonlinear="linear", granularity="per_row")),
+                    ("attn.", dict(bits=6, nonlinear="linear", granularity="per_col")),
+                    ("mlp.", dict(bits=6, nonlinear="linear", granularity="per_col")),
+                ),
+            ),
         }
         method_names = parse_quant_benchmark_methods()
         benchmark_results: list[tuple[str, int, float, float]] = []
@@ -1542,13 +1647,23 @@ def main() -> None:
                 log0(f"quant_bench_skip unknown_method:{method_name}")
                 continue
 
-            bench_obj, _ = quantize_state_dict_nonlinear(
-                fp_state,
-                bits=int(cfg["bits"]),
-                nonlinear=str(cfg["nonlinear"]),
-                granularity=str(cfg["granularity"]),
-                mu=LOG_COMPAND_MU,
-            )
+            if cfg.get("kind") == "mixed":
+                bench_obj, _ = quantize_state_dict_nonlinear_mixed(
+                    fp_state,
+                    default_cfg=dict(cfg["default"]),
+                    overrides=tuple(cfg["overrides"]),
+                    mu=LOG_COMPAND_MU,
+                )
+                cfg_desc = "mixed"
+            else:
+                bench_obj, _ = quantize_state_dict_nonlinear(
+                    fp_state,
+                    bits=int(cfg["bits"]),
+                    nonlinear=str(cfg["nonlinear"]),
+                    granularity=str(cfg["granularity"]),
+                    mu=LOG_COMPAND_MU,
+                )
+                cfg_desc = f"bits:{cfg['bits']} nonlinear:{cfg['nonlinear']} granularity:{cfg['granularity']}"
             bench_buf = io.BytesIO()
             torch.save(bench_obj, bench_buf)
             bench_blob = zlib.compress(bench_buf.getvalue(), level=9)
@@ -1573,9 +1688,9 @@ def main() -> None:
             torch.cuda.synchronize()
             benchmark_results.append((method_name, bench_bytes, bench_val_loss, bench_val_bpb))
             log0(
-                f"quant_bench method:{method_name} bits:{cfg['bits']} nonlinear:{cfg['nonlinear']} "
-                f"granularity:{cfg['granularity']} artifact_bytes:{bench_bytes} val_loss:{bench_val_loss:.6f} "
-                f"val_bpb:{bench_val_bpb:.6f} eval_time:{1000.0 * (time.perf_counter() - t_bench):.0f}ms"
+                f"quant_bench method:{method_name} {cfg_desc} artifact_bytes:{bench_bytes} "
+                f"val_loss:{bench_val_loss:.6f} val_bpb:{bench_val_bpb:.6f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_bench):.0f}ms"
             )
 
         if master_process and benchmark_results:
