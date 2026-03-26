@@ -282,34 +282,9 @@ def eval_val(
 
 
 INT6_MAX_Q = 31.0
-QAT_GROUP_SIZE = int(os.environ.get("QAT_GROUP_SIZE", 32))
 
 def quantize_dequantize_int6(t: Tensor) -> Tensor:
     t32 = t.float()
-
-    if t32.ndim == 2:
-        rows, cols = t32.shape
-        g = max(1, min(QAT_GROUP_SIZE, cols))
-        pad = (g - (cols % g)) % g
-        if pad:
-            tpad = F.pad(t32, (0, pad))
-        else:
-            tpad = t32
-
-        cols_padded = tpad.shape[1]
-        groups = cols_padded // g
-        tg = tpad.view(rows, groups, g)
-
-        # grouped per-col-ish linear amax scaling
-        max_abs = tg.abs().amax(dim=(0, 2), keepdim=True)
-        scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
-
-        q = torch.clamp(torch.round(tg / scale), -INT6_MAX_Q, INT6_MAX_Q)
-        dq = (q * scale).view(rows, cols_padded)
-        if pad:
-            dq = dq[:, :cols]
-        return dq.to(dtype=t.dtype)
-
     max_abs = t32.abs().amax()
     scale = torch.clamp(max_abs / INT6_MAX_Q, min=1.0 / INT6_MAX_Q)
     q = torch.clamp(torch.round(t32 / scale), -INT6_MAX_Q, INT6_MAX_Q)
