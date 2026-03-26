@@ -501,9 +501,9 @@ def dequantize_state_dict_q6col_v1(obj: dict[str, object]) -> dict[str, Tensor]:
         dtype = CODE_TO_DTYPE[int(obj["d"][name])]
         s = obj["s"][name].to(dtype=torch.float32)
         if s.ndim > 0 and q.ndim == 2:
-            out[name] = (q.float() * s.view(1, s.shape[0])).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * (s.view(1, s.shape[0]) / INT6_MAX_Q)).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * (float(s.item()) / INT6_MAX_Q)).to(dtype=dtype).contiguous()
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
     return out
