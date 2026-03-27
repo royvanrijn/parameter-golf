@@ -104,9 +104,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     qat_alpha_delay = float(os.environ.get("QAT_ALPHA_DELAY", 0.0))
-    qat_alpha_ramp_power = float(os.environ.get("QAT_ALPHA_RAMP_POWER", args.qat_alpha_power))
     qat_alpha_power = float(os.environ.get("QAT_ALPHA_POWER", 2.0))
-    qat_enable_snap = bool(int(os.environ.get("QAT_ENABLE_SNAP", "0")))
     qat_snap_beta = float(os.environ.get("QAT_SNAP_BETA", 1.0))
 
     export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
@@ -1268,8 +1266,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"qat_alpha_power:{args.qat_alpha_power} "
-        f"qat_enable_snap:{args.qat_enable_snap} qat_snap_beta:{args.qat_snap_beta}"
+        f"qat_alpha_power:{args.qat_alpha_power} qat_snap_beta:{args.qat_snap_beta}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1310,7 +1307,7 @@ def main() -> None:
         if p <= args.qat_alpha_delay:
             return 0.0
         ramp = (p - args.qat_alpha_delay) / max(1e-9, 1.0 - args.qat_alpha_delay)
-        return ramp ** args.qat_alpha_ramp_power
+        return ramp ** args.qat_alpha_power
 
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
@@ -1332,8 +1329,6 @@ def main() -> None:
 
     @torch.no_grad()
     def apply_matrix_snap(alpha: float) -> None:
-        if not args.qat_enable_snap:
-            return
         for p in matrix_params:
             mode = matrix_param_modes.get(id(p), DEFAULT_QUANT_MODE)
             if mode == "fp16":
