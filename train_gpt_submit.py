@@ -77,6 +77,13 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))
+    ortho_init_min_dim = int(os.environ.get("ORTHO_INIT_MIN_DIM", "64"))
+
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
+    swa_every = int(os.environ.get("SWA_EVERY", "50"))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.5"))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -257,20 +264,6 @@ def eval_val(
     # Validation computes:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    # If EVAL_STRIDE < TRAIN_SEQ_LEN, run sliding-window eval that only scores
-    # the rightmost stride tokens in each window for richer context.
-    if 0 < args.eval_stride < args.train_seq_len:
-        return eval_val_sliding(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
 
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
@@ -696,6 +689,29 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
+def apply_ortho_init(model: nn.Module, num_layers: int, min_dim: int = 64) -> None:
+    proj_gain = 1.0 / math.sqrt(2.0 * num_layers)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, CastedLinear):
+            continue
+
+        w = module.weight
+        if w.ndim != 2:
+            continue
+        if min(w.shape) < min_dim:
+            continue
+
+        if getattr(module, "_zero_init", False):
+            continue
+
+        gain = proj_gain if (
+            name.endswith("attn.proj") or name.endswith("mlp.proj")
+        ) else 1.0
+
+        torch.nn.init.orthogonal_(w, gain=gain)
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
 
 class CausalSelfAttention(nn.Module):
     def __init__(
@@ -838,13 +854,9 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                if getattr(module, "_zero_init", False):
-                    nn.init.zeros_(module.weight)
-                else:
-                    nn.init.orthogonal_(module.weight, gain=1.0)
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+                nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -991,6 +1003,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    if args.ortho_init:
+        apply_ortho_init(base_model, num_layers=args.num_layers, min_dim=args.ortho_init_min_dim)
+
     casted_linear_modules = [m for m in base_model.modules() if isinstance(m, CastedLinear)]
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1165,6 +1181,9 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1239,6 +1258,18 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         apply_matrix_snap(alpha)
+
+        # SWA: collect checkpoints during late training / warmdown
+        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            if swa_state is None:
+                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_count = 1
+                log0(f"swa:start step:{step}")
+            else:
+                for name, t in base_model.state_dict().items():
+                    swa_state[name] += t.detach().cpu()
+                swa_count += 1
+
         invalidate_model_qat_cache()
         zero_grad_all()
 
@@ -1268,6 +1299,15 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    if args.swa_enabled and swa_state is not None and swa_count > 0:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            for name, tensor in swa_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1309,18 +1349,33 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_q6col_v1(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
+    if 0 < args.eval_stride < args.train_seq_len:
+        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args,
+            base_model,   # use base_model here
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+    else:
+        log0("final_eval_mode:standard")
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            base_model,   # use base_model here
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     torch.cuda.synchronize()
     log0(
         f"final_q6col_{args.export_codec}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
