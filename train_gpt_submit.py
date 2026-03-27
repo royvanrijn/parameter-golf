@@ -77,6 +77,8 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    qat_refresh_every = int(os.environ.get("QAT_REFRESH_EVERY", "1"))
+
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "1")))
     smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
 
@@ -677,13 +679,16 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         w = self.weight.to(x.dtype)
+        alpha = self.qat_alpha.to(device=x.device, dtype=x.dtype)
+
+        if alpha.item() == 0.0:
+            return F.linear(x, w, bias)
 
         if self._cached_qweight is None or not self._cache_valid:
             wq = quantize_dequantize_int6(self.weight.detach()).to(dtype=x.dtype)
         else:
             wq = self._cached_qweight.to(dtype=x.dtype)
 
-        alpha = self.qat_alpha.to(device=x.device, dtype=x.dtype)
         w_eff = w + (wq - w).detach() * alpha
         return F.linear(x, w_eff, bias)
 
@@ -821,7 +826,7 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         #x = torch.relu(self.fc(x))
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -1286,7 +1291,8 @@ def main() -> None:
 
         alpha = qat_alpha(step, alpha_elapsed_ms)
         set_model_qat_alpha(alpha)
-        refresh_model_qat_cache()
+        if alpha > 0 and step % args.qat_refresh_every == 0:
+            refresh_model_qat_cache()
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1315,7 +1321,6 @@ def main() -> None:
             opt.step()
         apply_matrix_snap(alpha)
 
-        invalidate_model_qat_cache()
         zero_grad_all()
 
         step += 1
