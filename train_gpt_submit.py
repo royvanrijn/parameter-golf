@@ -1147,14 +1147,20 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    def qat_alpha(step: int, elapsed_ms: float) -> float:
+    def training_progress(step: int, elapsed_ms: float) -> float:
         # Prefer wallclock when available, fall back to iterations otherwise.
         if max_wallclock_ms is not None and max_wallclock_ms > 0:
-            progress = min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
+            progress = elapsed_ms / max_wallclock_ms
         else:
             denom = max(args.iterations - 1, 1)
-            progress = min(max(step / denom, 0.0), 1.0)
-        return progress ** args.qat_alpha_power
+            progress = step / denom
+        return min(max(progress, 0.0), 1.0)
+
+    def qat_alpha(step: int, elapsed_ms: float) -> float:
+        return training_progress(step, elapsed_ms) ** args.qat_alpha_power
+
+    def swa_progress(step: int, elapsed_ms: float) -> float:
+        return training_progress(step, elapsed_ms)
 
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
@@ -1297,7 +1303,8 @@ def main() -> None:
         apply_matrix_snap(alpha)
 
         # SWA: collect checkpoints during late training / warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+        prog = training_progress(step, elapsed_ms)
+        if args.swa_enabled and prog >= args.swa_start_frac and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
