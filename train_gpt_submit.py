@@ -1338,6 +1338,20 @@ def main() -> None:
     )
 
     if args.swa_enabled and swa_state is not None and swa_count > 0:
+        pre_swa_val_loss, pre_swa_val_bpb = eval_val(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0(f"pre_swa val_loss:{pre_swa_val_loss:.4f} val_bpb:{pre_swa_val_bpb:.4f}")
+
         log0(f"swa:applying averaged {swa_count} checkpoints")
         current_state = base_model.state_dict()
         avg_state = {
@@ -1345,6 +1359,20 @@ def main() -> None:
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
+
+        post_swa_val_loss, post_swa_val_bpb = eval_val(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        log0(f"post_swa val_loss:{post_swa_val_loss:.4f} val_bpb:{post_swa_val_bpb:.4f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
