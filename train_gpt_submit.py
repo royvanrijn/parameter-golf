@@ -77,8 +77,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    qat_refresh_every = int(os.environ.get("QAT_REFRESH_EVERY", 4))
-
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "1")))
     smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
 
@@ -425,6 +423,33 @@ def quantize_dequantize_int6(t: Tensor) -> Tensor:
     q = torch.clamp(torch.round(t32 / scale), -INT6_MAX_Q, INT6_MAX_Q)
     return (q * scale).to(dtype=t.dtype)
 
+
+def quantize_dequantize_int8(t: Tensor) -> Tensor:
+    # Symmetric int8 fake-quant:
+    # - per-column linear amax scaling for 2D tensors
+    # - per-tensor linear amax scaling for vectors/scalars
+    t32 = t.float()
+    if t32.ndim == 2:
+        max_abs = t32.abs().amax(dim=0).clamp_min(1e-12)
+        scale = (max_abs / INT8_MAX_Q).clamp_min(1.0 / INT8_MAX_Q)
+        q = torch.clamp(torch.round(t32 / scale[None, :]), -INT8_MAX_Q, INT8_MAX_Q)
+        return (q * scale[None, :]).to(dtype=t.dtype)
+
+    max_abs = t32.abs().amax().clamp_min(1e-12)
+    scale = torch.clamp(max_abs / INT8_MAX_Q, min=1.0 / INT8_MAX_Q)
+    q = torch.clamp(torch.round(t32 / scale), -INT8_MAX_Q, INT8_MAX_Q)
+    return (q * scale).to(dtype=t.dtype)
+
+
+def quantize_dequantize_by_mode(t: Tensor, mode: str) -> Tensor:
+    if mode == "fp16":
+        return t
+    if mode == "int8":
+        return quantize_dequantize_int8(t)
+    if mode == "int6":
+        return quantize_dequantize_int6(t)
+    raise ValueError(f"Unsupported quantization mode: {mode!r}")
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -441,32 +466,68 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT6_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT6_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
+VALID_QUANT_MODES = frozenset({"int6", "int8", "fp16"})
+DEFAULT_QUANT_MODE = os.environ.get("DEFAULT_QUANT_MODE", "int6").strip().lower()
+if DEFAULT_QUANT_MODE not in VALID_QUANT_MODES:
+    raise ValueError(
+        f"Invalid DEFAULT_QUANT_MODE={DEFAULT_QUANT_MODE!r}; expected one of {sorted(VALID_QUANT_MODES)}"
+    )
+DEFAULT_QUANT_OVERRIDES_RAW = ",".join(f"{pattern}=fp16" for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+QUANT_OVERRIDES_RAW = os.environ.get("QUANT_OVERRIDES", DEFAULT_QUANT_OVERRIDES_RAW).strip()
 INT6_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT6_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT6_PER_ROW_SCALE_DTYPE = torch.float16
 INT6_CLIP_PERCENTILE = 99.99984
 INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
 
+INT8_MAX_Q = 127.0
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+
+def parse_quant_overrides(raw: str) -> list[tuple[str, str]]:
+    if not raw:
+        return []
+    overrides: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        entry = item.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"Invalid QUANT_OVERRIDES entry {entry!r}; expected pattern=mode"
+            )
+        pattern, mode = entry.split("=", 1)
+        pattern = pattern.strip()
+        mode = mode.strip().lower()
+        if not pattern:
+            raise ValueError(
+                f"Invalid QUANT_OVERRIDES entry {entry!r}; pattern must be non-empty"
+            )
+        if mode not in VALID_QUANT_MODES:
+            raise ValueError(
+                f"Invalid QUANT_OVERRIDES mode {mode!r} for pattern {pattern!r}; "
+                f"expected one of {sorted(VALID_QUANT_MODES)}"
+            )
+        overrides.append((pattern, mode))
+    return sorted(overrides, key=lambda x: len(x[0]), reverse=True)
+
+
+QUANT_OVERRIDES = parse_quant_overrides(QUANT_OVERRIDES_RAW)
+
+
+def resolve_quant_mode(name: str) -> str:
+    for pattern, mode in QUANT_OVERRIDES:
+        if pattern in name:
+            return mode
+    return DEFAULT_QUANT_MODE
+
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT6_KEEP_FLOAT_FP32_NAME_PATTERNS):
-        return t.float().contiguous()
-    if t.dtype in {torch.float32, torch.bfloat16}:
-        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-        return t.to(dtype=INT6_KEEP_FLOAT_STORE_DTYPE).contiguous()
-    return t
-
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -488,16 +549,47 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
-def quantize_float_tensor_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         clip_abs = torch.quantile(t32.abs(), INT6_CLIP_Q, dim=0).clamp_min(1e-12)
         q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs[None, :], clip_abs[None, :]) / clip_abs[None, :] * INT6_MAX_Q), -INT6_MAX_Q, INT6_MAX_Q)
         return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT6_PER_ROW_SCALE_DTYPE).contiguous()
-    return quantize_float_tensor(t)
+    return quantize_float_tensor_int6(t)
+
+
+def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / INT8_MAX_Q).clamp_min(1.0 / INT8_MAX_Q)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / INT8_MAX_Q if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
+    return q, scale
+
+
+def quantize_float_tensor_by_mode(t: Tensor, mode: str) -> tuple[Tensor, Tensor]:
+    if mode == "int6":
+        return quantize_float_tensor_int6_per_col(t)
+    if mode == "int8":
+        return quantize_float_tensor_int8(t)
+    raise ValueError(f"Unsupported quantized mode {mode!r}")
 
 DTYPE_TO_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2, torch.int64: 3, torch.int32: 4, torch.uint8: 5}
 CODE_TO_DTYPE = {v: k for k, v in DTYPE_TO_CODE.items()}
+
+
+QUANT_MODE_TO_CODE = {"int6": 0, "int8": 1, "fp16": 2}
+CODE_TO_QUANT_MODE = {v: k for k, v in QUANT_MODE_TO_CODE.items()}
 
 
 def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
@@ -507,6 +599,7 @@ def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
     scales: dict[str, Tensor] = {}
     passthrough: dict[str, Tensor] = {}
     dtypes: dict[str, int] = {}
+    quant_modes: dict[str, int] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
         0,
@@ -519,13 +612,15 @@ def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
         dtypes[name] = DTYPE_TO_CODE.get(t.dtype, DTYPE_TO_CODE[torch.float16])
+        quant_mode = resolve_quant_mode(name)
+        quant_modes[name] = QUANT_MODE_TO_CODE[quant_mode]
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
             stats["int6_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        if t.numel() <= INT6_KEEP_FLOAT_MAX_NUMEL:
+        if quant_mode == "fp16" or t.numel() <= INT6_KEEP_FLOAT_MAX_NUMEL:
             kept = t.to(dtype=INT6_KEEP_FLOAT_STORE_DTYPE).contiguous()
             passthrough[name] = kept
             dtypes[name] = DTYPE_TO_CODE.get(t.dtype, DTYPE_TO_CODE[torch.float16])
@@ -533,22 +628,25 @@ def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_per_col(t)
+        q, s = quantize_float_tensor_by_mode(t, quant_mode)
         quantized[name] = q
         scales[name] = s
         stats["int6_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-    return {"fmt": "q6col_v1", "q": quantized, "s": scales, "p": passthrough, "d": dtypes}, stats
+    return {"fmt": "q6col_v1", "q": quantized, "s": scales, "p": passthrough, "d": dtypes, "m": quant_modes}, stats
 
 
 def dequantize_state_dict_q6col_v1(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
+    quant_modes = obj.get("m", {})
     for name, q in obj["q"].items():
         dtype = CODE_TO_DTYPE[int(obj["d"][name])]
+        mode = CODE_TO_QUANT_MODE.get(int(quant_modes.get(name, QUANT_MODE_TO_CODE["int6"])), "int6")
+        max_q = INT8_MAX_Q if mode == "int8" else INT6_MAX_Q
         s = obj["s"][name].to(dtype=torch.float32)
         if s.ndim > 0 and q.ndim == 2:
-            out[name] = (q.float() * (s.view(1, s.shape[0]) / INT6_MAX_Q)).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * (s.view(1, s.shape[0]) / max_q)).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * (float(s.item()) / INT6_MAX_Q)).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * (float(s.item()) / max_q)).to(dtype=dtype).contiguous()
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
     return out
@@ -664,13 +762,22 @@ class CastedLinear(nn.Linear):
         self.register_buffer("qat_alpha", torch.tensor(0.0, dtype=torch.float32), persistent=False)
         self._qat_alpha_value = 0.0
         self._qat_enabled = False
+        self._qat_exempt = False
+        self._quant_name = ""
+        self._quant_mode = "int6"
+        self._quant_name = ""
+        self._quant_mode = "int6"
         self._cached_qweight: Tensor | None = None
         self._cache_valid = False
 
     @torch.no_grad()
     def refresh_qat_cache(self) -> None:
+        if self._qat_exempt:
+            self._cached_qweight = None
+            self._cache_valid = False
+            return
         w = self.weight.detach()
-        self._cached_qweight = quantize_dequantize_int6(w).contiguous()
+        self._cached_qweight = quantize_dequantize_by_mode(w, self._quant_mode).contiguous()
         self._cache_valid = True
 
     @torch.no_grad()
@@ -682,13 +789,13 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         w = self.weight.to(x.dtype)
 
-        if not self._qat_enabled:
+        if self._qat_exempt or not self._qat_enabled:
             return F.linear(x, w, bias)
 
         alpha = self._qat_alpha_value
 
         if self._cached_qweight is None or not self._cache_valid:
-            wq = quantize_dequantize_int6(self.weight.detach()).to(dtype=x.dtype)
+            wq = quantize_dequantize_by_mode(self.weight.detach(), self._quant_mode).to(dtype=x.dtype)
         else:
             wq = self._cached_qweight.to(dtype=x.dtype)
 
@@ -828,8 +935,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        #x = torch.relu(self.fc(x))
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -1061,9 +1167,12 @@ def main() -> None:
         use_smear_gate=args.use_smear_gate,
         smear_init=args.smear_init,
     ).to(device).bfloat16()
-    for module in base_model.modules():
+    for full_name, module in base_model.named_modules():
         if isinstance(module, CastedLinear):
             module.float()
+            module._quant_name = full_name
+            module._quant_mode = resolve_quant_mode(f"{full_name}.weight")
+            module._qat_exempt = module._quant_mode == "fp16"
     restore_low_dim_params_to_fp32(base_model)
 
     if args.ortho_init:
@@ -1079,11 +1188,13 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
+    matrix_named_params = [
+        (name, p)
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_params = [p for _, p in matrix_named_params]
+    matrix_param_modes = {id(p): resolve_quant_mode(f"blocks.{name}") for name, p in matrix_named_params}
     scalar_params = [
         p
         for name, p in block_named_params
@@ -1189,9 +1300,14 @@ def main() -> None:
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
         for module in casted_linear_modules:
-            module.qat_alpha.fill_(alpha)
-            module._qat_alpha_value = float(alpha)
-            module._qat_enabled = alpha > 0.0
+            if module._qat_exempt:
+                module.qat_alpha.zero_()
+                module._qat_alpha_value = 0.0
+                module._qat_enabled = False
+            else:
+                module.qat_alpha.fill_(alpha)
+                module._qat_alpha_value = float(alpha)
+                module._qat_enabled = alpha > 0.0
 
     @torch.no_grad()
     def refresh_model_qat_cache() -> None:
@@ -1208,7 +1324,10 @@ def main() -> None:
         if not args.qat_enable_snap:
             return
         for p in matrix_params:
-            p.add_(quantize_dequantize_int6(p) - p, alpha=args.qat_snap_beta * alpha)
+            mode = matrix_param_modes.get(id(p), DEFAULT_QUANT_MODE)
+            if mode == "fp16":
+                continue
+            p.add_(quantize_dequantize_by_mode(p, mode) - p, alpha=args.qat_snap_beta * alpha)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1296,11 +1415,7 @@ def main() -> None:
 
         alpha = qat_alpha(step, alpha_elapsed_ms)
         set_model_qat_alpha(alpha)
-        if alpha > 0 and (
-            step % args.qat_refresh_every == 0
-            or any(not m._cache_valid for m in casted_linear_modules)
-        ):
-            refresh_model_qat_cache()
+        refresh_model_qat_cache()
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1329,6 +1444,7 @@ def main() -> None:
             opt.step()
         apply_matrix_snap(alpha)
 
+        invalidate_model_qat_cache()
         zero_grad_all()
 
         step += 1
