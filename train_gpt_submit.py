@@ -760,11 +760,8 @@ class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__(in_features, out_features, bias=bias)
         self.register_buffer("qat_alpha", torch.tensor(0.0, dtype=torch.float32), persistent=False)
-        self._qat_alpha_value = 0.0
         self._qat_enabled = False
         self._qat_exempt = False
-        self._quant_name = ""
-        self._quant_mode = "int6"
         self._quant_name = ""
         self._quant_mode = "int6"
         self._cached_qweight: Tensor | None = None
@@ -792,7 +789,7 @@ class CastedLinear(nn.Linear):
         if self._qat_exempt or not self._qat_enabled:
             return F.linear(x, w, bias)
 
-        alpha = self._qat_alpha_value
+        alpha = self.qat_alpha.to(device=x.device, dtype=x.dtype)
 
         if self._cached_qweight is None or not self._cache_valid:
             wq = quantize_dequantize_by_mode(self.weight.detach(), self._quant_mode).to(dtype=x.dtype)
@@ -1300,13 +1297,10 @@ def main() -> None:
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
         for module in casted_linear_modules:
+            module.qat_alpha.fill_(alpha)
             if module._qat_exempt:
-                module.qat_alpha.zero_()
-                module._qat_alpha_value = 0.0
                 module._qat_enabled = False
             else:
-                module.qat_alpha.fill_(alpha)
-                module._qat_alpha_value = float(alpha)
                 module._qat_enabled = alpha > 0.0
 
     @torch.no_grad()
