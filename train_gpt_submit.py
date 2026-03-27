@@ -77,7 +77,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    qat_refresh_every = int(os.environ.get("QAT_REFRESH_EVERY", "1"))
+    qat_refresh_every = int(os.environ.get("QAT_REFRESH_EVERY", 4))
 
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "1")))
     smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
@@ -1291,7 +1291,10 @@ def main() -> None:
 
         alpha = qat_alpha(step, alpha_elapsed_ms)
         set_model_qat_alpha(alpha)
-        if alpha > 0 and step % args.qat_refresh_every == 0:
+        if alpha > 0 and (
+            step % args.qat_refresh_every == 0
+            or any(not m._cache_valid for m in casted_linear_modules)
+        ):
             refresh_model_qat_cache()
 
         zero_grad_all()
