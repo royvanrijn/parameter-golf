@@ -561,20 +561,21 @@ def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
 def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=0).clamp_min(1e-12)
+        q = torch.clamp(
+            torch.round(
+                torch.clamp(t32, -clip_abs[None, :], clip_abs[None, :])
+                / clip_abs[None, :] * INT8_MAX_Q
+            ),
+            -INT8_MAX_Q,
+            INT8_MAX_Q,
         )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / INT8_MAX_Q).clamp_min(1.0 / INT8_MAX_Q)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / INT8_MAX_Q if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
-    return q, scale
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT8_MAX_Q, INT8_MAX_Q)
+    return q.to(torch.int8).contiguous(), scale
 
 
 def quantize_float_tensor_by_mode(t: Tensor, mode: str) -> tuple[Tensor, Tensor]:
@@ -592,16 +593,16 @@ QUANT_MODE_TO_CODE = {"int6": 0, "int8": 1, "fp16": 2}
 CODE_TO_QUANT_MODE = {v: k for k, v in QUANT_MODE_TO_CODE.items()}
 
 
-def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
+def quantize_state_dict_v(state_dict: dict[str, Tensor]):
     # Compact export object:
-    # {"fmt":"q6col_v1","q":{...},"s":{...},"p":{...},"d":{name:dtype_code}}
+    # {"fmt":"v","q":{...},"s":{...},"p":{...},"d":{name:dtype_code}}
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     passthrough: dict[str, Tensor] = {}
     dtypes: dict[str, int] = {}
     quant_modes: dict[str, int] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "qat_payload_bytes"),
         0,
     )
 
@@ -617,25 +618,25 @@ def quantize_state_dict_q6col_v1(state_dict: dict[str, Tensor]):
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
-            stats["int6_payload_bytes"] += tensor_nbytes(t)
+            stats["qat_payload_bytes"] += tensor_nbytes(t)
             continue
 
         if quant_mode == "fp16" or t.numel() <= INT6_KEEP_FLOAT_MAX_NUMEL:
             kept = t.to(dtype=INT6_KEEP_FLOAT_STORE_DTYPE).contiguous()
             passthrough[name] = kept
             dtypes[name] = DTYPE_TO_CODE.get(t.dtype, DTYPE_TO_CODE[torch.float16])
-            stats["int6_payload_bytes"] += tensor_nbytes(kept)
+            stats["qat_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor_by_mode(t, quant_mode)
         quantized[name] = q
         scales[name] = s
-        stats["int6_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-    return {"fmt": "q6col_v1", "q": quantized, "s": scales, "p": passthrough, "d": dtypes, "m": quant_modes}, stats
+        stats["qat_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    return {"fmt": "v", "q": quantized, "s": scales, "p": passthrough, "d": dtypes, "m": quant_modes}, stats
 
 
-def dequantize_state_dict_q6col_v1(obj: dict[str, object]) -> dict[str, Tensor]:
+def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     quant_modes = obj.get("m", {})
     for name, q in obj["q"].items():
@@ -643,10 +644,20 @@ def dequantize_state_dict_q6col_v1(obj: dict[str, object]) -> dict[str, Tensor]:
         mode = CODE_TO_QUANT_MODE.get(int(quant_modes.get(name, QUANT_MODE_TO_CODE["int6"])), "int6")
         max_q = INT8_MAX_Q if mode == "int8" else INT6_MAX_Q
         s = obj["s"][name].to(dtype=torch.float32)
-        if s.ndim > 0 and q.ndim == 2:
-            out[name] = (q.float() * (s.view(1, s.shape[0]) / max_q)).to(dtype=dtype).contiguous()
+
+        if q.ndim == 2 and s.ndim > 0:
+            if s.numel() == q.shape[1]:
+                scale = s.view(1, -1) / max_q      # per-column
+            elif s.numel() == q.shape[0]:
+                scale = s.view(-1, 1) / max_q      # per-row
+            else:
+                raise ValueError(
+                    f"Scale shape mismatch for {name}: q.shape={tuple(q.shape)} s.shape={tuple(s.shape)}"
+                )
+            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
         else:
             out[name] = (q.float() * (float(s.item()) / max_q)).to(dtype=dtype).contiguous()
+
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
     return out
@@ -1479,31 +1490,31 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_q6col_v1(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_v(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = compress_blob(quant_raw, codec=args.export_codec, level=args.export_codec_level)
     quant_raw_bytes = len(quant_raw)
-    artifact_name = f"final_model.q6col.{args.export_codec}"
+    artifact_name = f"final_model.{args.export_codec}"
     if master_process:
         with open(artifact_name, "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize(artifact_name)
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int6_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["qat_payload_bytes"], 1)
         log0(
-            f"Serialized model q6col+{args.export_codec}: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int6_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model {args.export_codec}: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['qat_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size q6col+{args.export_codec}: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size {args.export_codec}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open(artifact_name, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(decompress_blob(quant_blob_disk, codec=args.export_codec)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_q6col_v1(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict_v(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     if 0 < args.eval_stride < args.train_seq_len:
@@ -1535,10 +1546,10 @@ def main() -> None:
         )
     torch.cuda.synchronize()
     log0(
-        f"final_q6col_{args.export_codec}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_{args.export_codec}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_q6col_{args.export_codec}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_{args.export_codec}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
