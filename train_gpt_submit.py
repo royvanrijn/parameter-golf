@@ -77,12 +77,11 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
+    smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
+
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))
     ortho_init_min_dim = int(os.environ.get("ORTHO_INIT_MIN_DIM", "64"))
-
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
-    swa_every = int(os.environ.get("SWA_EVERY", "50"))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", "0.5"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -800,6 +799,16 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+class SmearGate(nn.Module):
+    """Blend each token embedding with the previous token embedding."""
+    def __init__(self, dim: int, init: float = -2.0):
+        super().__init__()
+        self.gate = nn.Parameter(torch.full((dim,), init, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1.0 - g) * x + g * x_prev
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
@@ -857,6 +866,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_smear_gate: bool,
+        smear_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -886,6 +897,7 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.smear = SmearGate(model_dim, init=smear_init) if use_smear_gate else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -898,6 +910,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1035,6 +1049,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_smear_gate=args.use_smear_gate,
+        smear_init=args.smear_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1066,6 +1082,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if getattr(base_model, "smear", None) is not None:
+        scalar_params.extend(list(base_model.smear.parameters()))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1159,9 +1177,6 @@ def main() -> None:
     def qat_alpha(step: int, elapsed_ms: float) -> float:
         return training_progress(step, elapsed_ms) ** args.qat_alpha_power
 
-    def swa_progress(step: int, elapsed_ms: float) -> float:
-        return training_progress(step, elapsed_ms)
-
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
         for module in casted_linear_modules:
@@ -1223,9 +1238,6 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
 
     step = 0
     while True:
@@ -1302,18 +1314,6 @@ def main() -> None:
             opt.step()
         apply_matrix_snap(alpha)
 
-        # SWA: collect checkpoints during late training / warmdown
-        prog = training_progress(step, elapsed_ms)
-        if args.swa_enabled and prog >= args.swa_start_frac and step % args.swa_every == 0:
-            if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
-            else:
-                for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
-
         invalidate_model_qat_cache()
         zero_grad_all()
 
@@ -1343,43 +1343,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-
-    if args.swa_enabled and swa_state is not None and swa_count > 0:
-        pre_swa_val_loss, pre_swa_val_bpb = eval_val(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
-        log0(f"pre_swa val_loss:{pre_swa_val_loss:.4f} val_bpb:{pre_swa_val_bpb:.4f}")
-
-        log0(f"swa:applying averaged {swa_count} checkpoints")
-        current_state = base_model.state_dict()
-        avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
-            for name, tensor in swa_state.items()
-        }
-        base_model.load_state_dict(avg_state, strict=True)
-
-        post_swa_val_loss, post_swa_val_bpb = eval_val(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
-        log0(f"post_swa val_loss:{post_swa_val_loss:.4f} val_bpb:{post_swa_val_bpb:.4f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1425,7 +1388,7 @@ def main() -> None:
         log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
         q_val_loss, q_val_bpb = eval_val_sliding(
             args,
-            base_model,   # use base_model here
+            base_model,
             rank,
             world_size,
             device,
@@ -1438,7 +1401,7 @@ def main() -> None:
         log0("final_eval_mode:standard")
         q_val_loss, q_val_bpb = eval_val(
             args,
-            base_model,   # use base_model here
+            base_model,
             rank,
             world_size,
             device,
