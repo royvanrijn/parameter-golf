@@ -78,7 +78,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
-    smear_init = float(os.environ.get("SMEAR_INIT", "-1.0"))
+    smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
 
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))
     ortho_init_min_dim = int(os.environ.get("ORTHO_INIT_MIN_DIM", "64"))
@@ -88,8 +88,8 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
 
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
