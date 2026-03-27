@@ -77,7 +77,7 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
+    use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "1")))
     smear_init = float(os.environ.get("SMEAR_INIT", "-2.0"))
 
     ortho_init = bool(int(os.environ.get("ORTHO_INIT", "1")))
@@ -86,14 +86,14 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
 
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
-    adamw_weight_decay = float(os.environ.get("ADAMW_WEIGHT_DECAY", 0.01))
+    adamw_weight_decay = float(os.environ.get("ADAMW_WEIGHT_DECAY", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
@@ -820,7 +820,8 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        #x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         return self.proj(x.square())
 
 
