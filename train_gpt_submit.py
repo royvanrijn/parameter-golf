@@ -311,10 +311,9 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-
 def eval_val_sliding(
     args: Hyperparameters,
-    model: nn.Module,
+    base_model: nn.Module,
     rank: int,
     world_size: int,
     device: torch.device,
@@ -325,49 +324,87 @@ def eval_val_sliding(
 ) -> tuple[float, float]:
     seq_len = args.train_seq_len
     stride = max(1, min(args.eval_stride, seq_len))
-    n = val_tokens.numel()
-    windows = (n - seq_len - 1) // stride + 1
-    w0, w1 = (windows * rank) // world_size, (windows * (rank + 1)) // world_size
-    batch = max(1, args.eval_batch_seqs)
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    batch_seqs = max(1, args.eval_batch_seqs)
 
-    model.eval()
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
     with torch.inference_mode():
-        for i in range(w0, w1, batch):
-            j = min(i + batch, w1)
-            xs, ys = [], []
-            for wi in range(i, j):
-                s = wi * stride
-                x = val_tokens[s : s + seq_len].to(device=device, dtype=torch.int64, non_blocking=True)
-                y = val_tokens[s + 1 : s + seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-                xs.append(x)
-                ys.append(y)
-            x = torch.stack(xs, dim=0)
-            y = torch.stack(ys, dim=0)
-            k = stride if i > 0 else seq_len
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device, non_blocking=True)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = model(x)
-            loss = F.cross_entropy(logits[:, -k:, :].reshape(-1, logits.size(-1)), y[:, -k:].reshape(-1), reduction="mean")
-            val_loss_sum += loss.to(torch.float64) * float(y[:, -k:].numel())
-            val_token_count += float(y[:, -k:].numel())
-            prev_ids = x[:, -k:].reshape(-1)
-            tgt_ids = y[:, -k:].reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+                logits = base_model(x_batch)
+
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+
+                prev_ids = x_batch[i, s:wlen]
+                tgt_ids = y_batch[i, s:wlen]
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (
+                    has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+                ).to(dtype=torch.int16)
+                byte_count += token_bytes.to(torch.float64).sum()
+
+            if rank == 0 and ((bi // batch_seqs) % 50 == 0):
+                done = min(bi + bsz, len(my_windows))
+                pct = 100.0 * done / max(len(my_windows), 1)
+                running_bpb = 0.0
+                if token_count.item() > 0 and byte_count.item() > 0:
+                    rl = (loss_sum / token_count).item()
+                    running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
+                print(
+                    f"  sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows "
+                    f"running_bpb={running_bpb:.6f}",
+                    flush=True,
+                )
 
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
 
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 INT6_MAX_Q = 31.0
 
