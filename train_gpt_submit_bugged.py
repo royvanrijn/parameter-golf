@@ -102,9 +102,11 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    qat_alpha_delay = float(os.environ.get("QAT_ALPHA_DELAY", 0.0))
     qat_alpha_power = float(os.environ.get("QAT_ALPHA_POWER", 2.0))
-    qat_enable_snap = bool(int(os.environ.get("QAT_ENABLE_SNAP", "0")))
     qat_snap_beta = float(os.environ.get("QAT_SNAP_BETA", 1.0))
+
     export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
     export_codec_level = int(os.environ.get("EXPORT_CODEC_LEVEL", 19))
 
@@ -557,32 +559,41 @@ def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
         return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT6_PER_ROW_SCALE_DTYPE).contiguous()
     return quantize_float_tensor_int6(t)
 
-
 def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=0).clamp_min(1e-12)
-        q = torch.clamp(
-            torch.round(
-                torch.clamp(t32, -clip_abs[None, :], clip_abs[None, :])
-                / clip_abs[None, :] * INT8_MAX_Q
-            ),
-            -INT8_MAX_Q,
-            INT8_MAX_Q,
+        # Matrices get one scale per row, which usually tracks output-channel
+        # ranges much better than a single tensor-wide scale.
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
-        return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / INT8_MAX_Q).clamp_min(1.0 / INT8_MAX_Q)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
+    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / INT8_MAX_Q if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT8_MAX_Q, INT8_MAX_Q)
-    return q.to(torch.int8).contiguous(), scale
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -INT8_MAX_Q, INT8_MAX_Q).to(torch.int8).contiguous()
+    return q, scale
 
+
+def quantize_float_tensor_int8_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        clip_abs = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=0).clamp_min(1e-12)
+        q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs[None, :], clip_abs[None, :]) / clip_abs[None, :] * INT8_MAX_Q), -INT8_MAX_Q, INT8_MAX_Q)
+        return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    return quantize_float_tensor_int8(t)
 
 def quantize_float_tensor_by_mode(t: Tensor, mode: str) -> tuple[Tensor, Tensor]:
     if mode == "int6":
         return quantize_float_tensor_int6_per_col(t)
     if mode == "int8":
-        return quantize_float_tensor_int8(t)
+        return quantize_float_tensor_int8_per_col(t)
     raise ValueError(f"Unsupported quantized mode {mode!r}")
 
 DTYPE_TO_CODE = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2, torch.int64: 3, torch.int32: 4, torch.uint8: 5}
@@ -635,6 +646,17 @@ def quantize_state_dict_v(state_dict: dict[str, Tensor]):
         stats["qat_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
     return {"fmt": "v", "q": quantized, "s": scales, "p": passthrough, "d": dtypes, "m": quant_modes}, stats
 
+def quick_quant_summary(obj):
+    q = obj["q"]
+    s = obj["s"]
+    p = obj["p"]
+
+    q_bytes = sum(t.numel() * t.element_size() for t in q.values())
+    s_bytes = sum(t.numel() * t.element_size() for t in s.values())
+    p_bytes = sum(t.numel() * t.element_size() for t in p.values())
+
+    print(f"[quant] tensors: q={len(q)} s={len(s)} p={len(p)}")
+    print(f"[quant] bytes:   q={q_bytes} s={s_bytes} p={p_bytes} total={q_bytes+s_bytes+p_bytes}")
 
 def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -644,20 +666,10 @@ def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
         mode = CODE_TO_QUANT_MODE.get(int(quant_modes.get(name, QUANT_MODE_TO_CODE["int6"])), "int6")
         max_q = INT8_MAX_Q if mode == "int8" else INT6_MAX_Q
         s = obj["s"][name].to(dtype=torch.float32)
-
-        if q.ndim == 2 and s.ndim > 0:
-            if s.numel() == q.shape[1]:
-                scale = s.view(1, -1) / max_q      # per-column
-            elif s.numel() == q.shape[0]:
-                scale = s.view(-1, 1) / max_q      # per-row
-            else:
-                raise ValueError(
-                    f"Scale shape mismatch for {name}: q.shape={tuple(q.shape)} s.shape={tuple(s.shape)}"
-                )
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+        if s.ndim > 0 and q.ndim == 2:
+            out[name] = (q.float() * (s.view(1, s.shape[0]) / max_q)).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * (float(s.item()) / max_q)).to(dtype=dtype).contiguous()
-
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
     return out
@@ -1264,8 +1276,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"qat_alpha_power:{args.qat_alpha_power} "
-        f"qat_enable_snap:{args.qat_enable_snap} qat_snap_beta:{args.qat_snap_beta}"
+        f"qat_alpha_power:{args.qat_alpha_power} qat_snap_beta:{args.qat_snap_beta}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1302,7 +1313,11 @@ def main() -> None:
         return min(max(progress, 0.0), 1.0)
 
     def qat_alpha(step: int, elapsed_ms: float) -> float:
-        return training_progress(step, elapsed_ms) ** args.qat_alpha_power
+        p = training_progress(step, elapsed_ms)
+        if p <= args.qat_alpha_delay:
+            return 0.0
+        ramp = (p - args.qat_alpha_delay) / max(1e-9, 1.0 - args.qat_alpha_delay)
+        return ramp ** args.qat_alpha_power
 
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
@@ -1324,8 +1339,6 @@ def main() -> None:
 
     @torch.no_grad()
     def apply_matrix_snap(alpha: float) -> None:
-        if not args.qat_enable_snap:
-            return
         for p in matrix_params:
             mode = matrix_param_modes.get(id(p), DEFAULT_QUANT_MODE)
             if mode == "fp16":
@@ -1491,6 +1504,12 @@ def main() -> None:
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_v(base_model.state_dict())
+    quick_quant_summary(quant_obj)
+
+    print(f"[check] example shapes:")
+    for k in list(quant_obj["q"].keys())[:3]:
+        print(k, quant_obj["q"][k].shape, quant_obj["s"][k].shape)
+
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
