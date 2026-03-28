@@ -103,8 +103,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    qat_alpha_delay = float(os.environ.get("QAT_ALPHA_DELAY", 0.0))
     qat_alpha_power = float(os.environ.get("QAT_ALPHA_POWER", 2.0))
     qat_snap_beta = float(os.environ.get("QAT_SNAP_BETA", 1.0))
+
     export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
     export_codec_level = int(os.environ.get("EXPORT_CODEC_LEVEL", 19))
 
@@ -556,7 +558,6 @@ def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
         q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs[None, :], clip_abs[None, :]) / clip_abs[None, :] * INT6_MAX_Q), -INT6_MAX_Q, INT6_MAX_Q)
         return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT6_PER_ROW_SCALE_DTYPE).contiguous()
     return quantize_float_tensor_int6(t)
-
 
 def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -1273,8 +1274,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"qat_alpha_power:{args.qat_alpha_power} "
-        f"qat_enable_snap:{args.qat_enable_snap} qat_snap_beta:{args.qat_snap_beta}"
+        f"qat_alpha_power:{args.qat_alpha_power} qat_snap_beta:{args.qat_snap_beta}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1311,7 +1311,11 @@ def main() -> None:
         return min(max(progress, 0.0), 1.0)
 
     def qat_alpha(step: int, elapsed_ms: float) -> float:
-        return training_progress(step, elapsed_ms) ** args.qat_alpha_power
+        p = training_progress(step, elapsed_ms)
+        if p <= args.qat_alpha_delay:
+            return 0.0
+        ramp = (p - args.qat_alpha_delay) / max(1e-9, 1.0 - args.qat_alpha_delay)
+        return ramp ** args.qat_alpha_power
 
     @torch.no_grad()
     def set_model_qat_alpha(alpha: float) -> None:
