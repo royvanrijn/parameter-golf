@@ -649,16 +649,15 @@ def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
 
         if q.ndim == 2 and s.ndim > 0:
             if s.numel() == q.shape[1]:
-                scale = s.view(1, -1) / max_q      # per-column
+                out[name] = (q.float() * s.view(1, -1)).to(dtype=dtype).contiguous()
             elif s.numel() == q.shape[0]:
-                scale = s.view(-1, 1) / max_q      # per-row
+                out[name] = (q.float() * s.view(-1, 1)).to(dtype=dtype).contiguous()
             else:
                 raise ValueError(
-                    f"Scale shape mismatch for {name}: q.shape={tuple(q.shape)} s.shape={tuple(s.shape)}"
+                    f"Mismatch for {name}: q.shape={tuple(q.shape)} s.shape={tuple(s.shape)}"
                 )
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * (float(s.item()) / max_q)).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
 
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
