@@ -559,7 +559,6 @@ def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
         return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT6_PER_ROW_SCALE_DTYPE).contiguous()
     return quantize_float_tensor_int6(t)
 
-
 def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:

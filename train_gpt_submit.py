@@ -103,10 +103,8 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    qat_alpha_delay = float(os.environ.get("QAT_ALPHA_DELAY", 0.0))
     qat_alpha_power = float(os.environ.get("QAT_ALPHA_POWER", 2.0))
     qat_snap_beta = float(os.environ.get("QAT_SNAP_BETA", 1.0))
-
     export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
     export_codec_level = int(os.environ.get("EXPORT_CODEC_LEVEL", 19))
 
@@ -1275,7 +1273,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(
-        f"qat_alpha_power:{args.qat_alpha_power} qat_snap_beta:{args.qat_snap_beta}"
+        f"qat_alpha_power:{args.qat_alpha_power} "
+        f"qat_enable_snap:{args.qat_enable_snap} qat_snap_beta:{args.qat_snap_beta}"
     )
     log0(f"seed:{args.seed}")
 
@@ -1331,14 +1330,6 @@ def main() -> None:
     def invalidate_model_qat_cache() -> None:
         for module in casted_linear_modules:
             module.invalidate_qat_cache()
-
-    @torch.no_grad()
-    def apply_matrix_snap(alpha: float) -> None:
-        for p in matrix_params:
-            mode = matrix_param_modes.get(id(p), DEFAULT_QUANT_MODE)
-            if mode == "fp16":
-                continue
-            p.add_(quantize_dequantize_by_mode(p, mode) - p, alpha=args.qat_snap_beta * alpha)
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1453,7 +1444,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        apply_matrix_snap(alpha)
 
         invalidate_model_qat_cache()
         zero_grad_all()
