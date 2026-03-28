@@ -649,9 +649,9 @@ def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
 
         if q.ndim == 2 and s.ndim > 0:
             if s.numel() == q.shape[1]:
-                out[name] = (q.float() * s.view(1, -1)).to(dtype=dtype).contiguous()
+                out[name] = (q.float() * (s.view(1, -1) / max_q)).to(dtype=dtype).contiguous()
             elif s.numel() == q.shape[0]:
-                out[name] = (q.float() * s.view(-1, 1)).to(dtype=dtype).contiguous()
+                out[name] = (q.float() * (s.view(-1, 1) / max_q)).to(dtype=dtype).contiguous()
             else:
                 raise ValueError(
                     f"Mismatch for {name}: q.shape={tuple(q.shape)} s.shape={tuple(s.shape)}"
