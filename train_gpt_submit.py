@@ -658,7 +658,7 @@ def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
         if s.ndim > 0 and q.ndim == 2:
             out[name] = (q.float() * (s.view(1, s.shape[0]) / max_q)).to(dtype=dtype).contiguous()
         else:
-            out[name] = (q.float() * (float(s.item()) / max_q)).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
     for name, t in obj["p"].items():
         out[name] = t.detach().to("cpu").to(dtype=CODE_TO_DTYPE[int(obj["d"][name])]).contiguous()
     return out
