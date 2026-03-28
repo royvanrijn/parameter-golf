@@ -559,6 +559,7 @@ def quantize_float_tensor_int6_per_col(t: Tensor) -> tuple[Tensor, Tensor]:
         return q.to(torch.int8).contiguous(), clip_abs.to(dtype=INT6_PER_ROW_SCALE_DTYPE).contiguous()
     return quantize_float_tensor_int6(t)
 
+
 def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -645,18 +646,6 @@ def quantize_state_dict_v(state_dict: dict[str, Tensor]):
         scales[name] = s
         stats["qat_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
     return {"fmt": "v", "q": quantized, "s": scales, "p": passthrough, "d": dtypes, "m": quant_modes}, stats
-
-def quick_quant_summary(obj):
-    q = obj["q"]
-    s = obj["s"]
-    p = obj["p"]
-
-    q_bytes = sum(t.numel() * t.element_size() for t in q.values())
-    s_bytes = sum(t.numel() * t.element_size() for t in s.values())
-    p_bytes = sum(t.numel() * t.element_size() for t in p.values())
-
-    print(f"[quant] tensors: q={len(q)} s={len(s)} p={len(p)}")
-    print(f"[quant] bytes:   q={q_bytes} s={s_bytes} p={p_bytes} total={q_bytes+s_bytes+p_bytes}")
 
 def dequantize_state_dict_v(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
