@@ -136,101 +136,30 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         X = a * X + B @ X
     return X.T if transposed else X
 
-def gram_halley_step(
-    G: Tensor,
-    steps: int = 2,
-    eps: float = 1e-7,
-    init_lower_bound: float = 0.05,
-    jitter: float = 1e-6,
-    max_jitter_tries: int = 6,
-) -> Tensor:
-    """
-    Drop-in replacement for the current Muon Newton-Schulz orthogonalizer.
-
-    Uses a dynamically weighted Halley / rational polar iteration in Gram space:
-
-        X_{k+1} = X_k (a I + b H_k) (I + c H_k)^{-1}
-        H_k = X_k^T X_k
-
-    where a,b,c are updated from a conservative lower-bound tracker l_k.
-
-    Notes:
-    - Works on the small-side Gram matrix.
-    - Does the solve path in fp32 for stability.
-    - Returns the same shape as input, cast back to the input dtype.
-    """
-
-    orig_dtype = G.dtype
-    X = G
-
-    # Make X tall so Gram = X^T X is the smaller matrix.
-    transposed = X.size(0) < X.size(1)
+def zeropower_via_newtonschulz5_turbo(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    X = G.bfloat16()
+    transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
 
-    # Work in fp32 for the rational/solve path.
-    X = X.float()
+    ns_consts = [
+                (4.0848, -6.8946, 2.9270),
+                (3.9505, -6.3029, 2.6377),
+                (3.7418, -5.5913, 2.3037),
+                (2.8769, -3.1427, 1.2046),
+                (2.8366, -3.0525, 1.2012),
+            ][-steps:]
 
-    # Conservative scaling so ||X||_2 <= 1 approximately.
-    # Frobenius is crude but robust and cheap.
-    X = X / (X.norm() + eps)
+    for i, (a, b, c) in enumerate(ns_consts):
+        A = X @ X.T
+        if i == 0:
+            s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), eps))
+            X = X * s.unsqueeze(-1)
+            A = A * s.unsqueeze(-1) * s.unsqueeze(-2)
+        B = b * A + c * A @ A
+        X = a * X + B @ X
 
-    n = X.size(1)
-    I = torch.eye(n, device=X.device, dtype=X.dtype)
-
-    # Conservative lower-bound tracker for sigma_min / sigma_max.
-    # This is heuristic; keep it away from 0 to avoid huge coefficients.
-    l = float(init_lower_bound)
-
-    for _ in range(steps):
-        # DWH / QDWH-style coefficient update from lower bound l.
-        l2 = max(l * l, 1e-12)
-        d = (4.0 * (1.0 - l2) / (l2 * l2)) ** (1.0 / 3.0)
-        s = math.sqrt(1.0 + d)
-        a = s + 0.5 * math.sqrt(max(8.0 - 4.0 * d + 8.0 * (2.0 - l2) / (l2 * s), 1e-12))
-        b = ((a - 1.0) ** 2) / 4.0
-        c = a + b - 1.0
-
-        # Small-side Gram.
-        H = X.T @ X
-        H = 0.5 * (H + H.T)  # explicit symmetrization
-
-        # Rational update:
-        # X <- X (aI + bH) (I + cH)^(-1)
-        # Since both factors are polynomials in H, they commute,
-        # so cholesky_solve(A,B) ordering is fine.
-        numer = a * I + b * H
-        denom = I + c * H
-        denom = 0.5 * (denom + denom.T)
-
-        # Adaptive jittered Cholesky.
-        diag_mean = denom.diagonal().mean().abs().clamp_min(1.0).item()
-        lam = jitter * diag_mean
-
-        chol = None
-        for _try in range(max_jitter_tries):
-            L, info = torch.linalg.cholesky_ex(denom + lam * I)
-            if int(info.item()) == 0:
-                chol = L
-                break
-            lam *= 10.0
-
-        if chol is None:
-            # Last-resort fallback. Slower, but avoids hard failure.
-            solve_mat = torch.linalg.solve(denom + lam * I, numer)
-        else:
-            solve_mat = torch.cholesky_solve(numer, chol)
-
-        X = X @ solve_mat
-
-        # Update lower-bound tracker.
-        l = l * (a + b * l2) / (1.0 + c * l2)
-        l = min(max(l, 1e-3), 1.0)
-
-    if transposed:
-        X = X.T
-
-    return X.to(orig_dtype)
+    return X.T if transposed else X
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
@@ -1051,10 +980,10 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
-        #x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
-        #return self.proj(x)
+        #x = torch.relu(self.fc(x))
+        #return self.proj(x.square())
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
+        return self.proj(x)
 
 class Block(nn.Module):
     def __init__(
@@ -1182,7 +1111,7 @@ def main() -> None:
 
     if args.use_optimized_muon:
         # Use the optimized version:
-        zeropower_via_newtonschulz5 = gram_halley_step
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5_turbo)
     else:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
