@@ -91,14 +91,15 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
 
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 2)) # 2 instead of 5 now
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     adamw_weight_decay = float(os.environ.get("ADAMW_WEIGHT_DECAY", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
 
-    use_optimized_muon = bool(int(os.environ.get("OPTIMIZED_HALLEY", "0")))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
@@ -134,31 +135,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.T if transposed else X
-
-def zeropower_via_newtonschulz5_turbo(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    X = G.bfloat16()
-    transposed = G.size(0) > G.size(1)
-    if transposed:
-        X = X.T
-
-    ns_consts = [
-                (4.0848, -6.8946, 2.9270),
-                (3.9505, -6.3029, 2.6377),
-                (3.7418, -5.5913, 2.3037),
-                (2.8769, -3.1427, 1.2046),
-                (2.8366, -3.0525, 1.2012),
-            ][-steps:]
-
-    for i, (a, b, c) in enumerate(ns_consts):
-        A = X @ X.T
-        if i == 0:
-            s = torch.rsqrt(torch.clamp_min(A.abs().sum(dim=-1), eps))
-            X = X * s.unsqueeze(-1)
-            A = A * s.unsqueeze(-1) * s.unsqueeze(-2)
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-
     return X.T if transposed else X
 
 class Muon(torch.optim.Optimizer):
@@ -959,6 +935,40 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+class BigramHash(nn.Module):
+    """
+    Hash (prev_token, cur_token) -> small embedding -> project to model_dim.
+    Added to the hidden state as a shallow bigram prior.
+
+    Starts as a no-op because proj is zero-init, but still learns immediately
+    because the table is nonzero.
+    """
+    def __init__(self, vocab_size: int, num_buckets: int, emb_dim: int, model_dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_buckets = num_buckets
+        self.table = nn.Embedding(num_buckets, emb_dim)
+        self.proj = CastedLinear(emb_dim, model_dim, bias=False)
+        self.proj._zero_init = True  # start as no-op
+
+        # small random table so proj gets gradients on step 1
+        nn.init.normal_(self.table.weight, mean=0.0, std=0.02)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        # input_ids: [B, T]
+        prev_ids = torch.cat(
+            [torch.zeros_like(input_ids[:, :1]), input_ids[:, :-1]],
+            dim=1,
+        )
+
+        # Cheap pair hash. Keep it simple and deterministic.
+        # Using uint64-ish constants but staying in int64 ops.
+        pair = prev_ids.to(torch.int64) * 1315423911 + input_ids.to(torch.int64) * 2654435761
+        idx = torch.remainder(pair, self.num_buckets)
+
+        h = self.table(idx)           # [B, T, emb_dim]
+        return self.proj(h)           # [B, T, model_dim]
+
 class SmearGate(nn.Module):
     """Blend each token embedding with the previous token embedding."""
     def __init__(self, dim: int, init: float = -2.0):
@@ -1029,6 +1039,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         use_smear_gate: bool,
         smear_init: float,
+        bigram_hash_buckets: int,
+        bigram_hash_dim: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1059,6 +1071,11 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self.smear = SmearGate(model_dim, init=smear_init) if use_smear_gate else None
+        self.bigram = (
+            BigramHash(vocab_size, bigram_hash_buckets, bigram_hash_dim, model_dim)
+            if bigram_hash_buckets > 0
+            else None
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1072,6 +1089,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.smear is not None:
             x = self.smear(x)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids).to(dtype=x.dtype)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -1109,11 +1128,7 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
 
-    if args.use_optimized_muon:
-        # Use the optimized version:
-        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5_turbo)
-    else:
-        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1217,6 +1232,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         use_smear_gate=args.use_smear_gate,
         smear_init=args.smear_init,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
     ).to(device).bfloat16()
     for full_name, module in base_model.named_modules():
         if isinstance(module, CastedLinear):
