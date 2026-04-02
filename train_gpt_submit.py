@@ -91,12 +91,14 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
 
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 2)) # 2 instead of 5 now
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
     adamw_weight_decay = float(os.environ.get("ADAMW_WEIGHT_DECAY", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+
+    use_optimized_muon = bool(int(os.environ.get("OPTIMIZED_HALLEY", "0")))
 
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
@@ -116,6 +118,8 @@ class Hyperparameters:
 # 
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
+#
+# Improved Halley iteration version, should be faster/more accurate with less backend steps
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -132,6 +136,101 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         X = a * X + B @ X
     return X.T if transposed else X
 
+def gram_halley_step(
+    G: Tensor,
+    steps: int = 2,
+    eps: float = 1e-7,
+    init_lower_bound: float = 0.05,
+    jitter: float = 1e-6,
+    max_jitter_tries: int = 6,
+) -> Tensor:
+    """
+    Drop-in replacement for the current Muon Newton-Schulz orthogonalizer.
+
+    Uses a dynamically weighted Halley / rational polar iteration in Gram space:
+
+        X_{k+1} = X_k (a I + b H_k) (I + c H_k)^{-1}
+        H_k = X_k^T X_k
+
+    where a,b,c are updated from a conservative lower-bound tracker l_k.
+
+    Notes:
+    - Works on the small-side Gram matrix.
+    - Does the solve path in fp32 for stability.
+    - Returns the same shape as input, cast back to the input dtype.
+    """
+
+    orig_dtype = G.dtype
+    X = G
+
+    # Make X tall so Gram = X^T X is the smaller matrix.
+    transposed = X.size(0) < X.size(1)
+    if transposed:
+        X = X.T
+
+    # Work in fp32 for the rational/solve path.
+    X = X.float()
+
+    # Conservative scaling so ||X||_2 <= 1 approximately.
+    # Frobenius is crude but robust and cheap.
+    X = X / (X.norm() + eps)
+
+    n = X.size(1)
+    I = torch.eye(n, device=X.device, dtype=X.dtype)
+
+    # Conservative lower-bound tracker for sigma_min / sigma_max.
+    # This is heuristic; keep it away from 0 to avoid huge coefficients.
+    l = float(init_lower_bound)
+
+    for _ in range(steps):
+        # DWH / QDWH-style coefficient update from lower bound l.
+        l2 = max(l * l, 1e-12)
+        d = (4.0 * (1.0 - l2) / (l2 * l2)) ** (1.0 / 3.0)
+        s = math.sqrt(1.0 + d)
+        a = s + 0.5 * math.sqrt(max(8.0 - 4.0 * d + 8.0 * (2.0 - l2) / (l2 * s), 1e-12))
+        b = ((a - 1.0) ** 2) / 4.0
+        c = a + b - 1.0
+
+        # Small-side Gram.
+        H = X.T @ X
+        H = 0.5 * (H + H.T)  # explicit symmetrization
+
+        # Rational update:
+        # X <- X (aI + bH) (I + cH)^(-1)
+        # Since both factors are polynomials in H, they commute,
+        # so cholesky_solve(A,B) ordering is fine.
+        numer = a * I + b * H
+        denom = I + c * H
+        denom = 0.5 * (denom + denom.T)
+
+        # Adaptive jittered Cholesky.
+        diag_mean = denom.diagonal().mean().abs().clamp_min(1.0).item()
+        lam = jitter * diag_mean
+
+        chol = None
+        for _try in range(max_jitter_tries):
+            L, info = torch.linalg.cholesky_ex(denom + lam * I)
+            if int(info.item()) == 0:
+                chol = L
+                break
+            lam *= 10.0
+
+        if chol is None:
+            # Last-resort fallback. Slower, but avoids hard failure.
+            solve_mat = torch.linalg.solve(denom + lam * I, numer)
+        else:
+            solve_mat = torch.cholesky_solve(numer, chol)
+
+        X = X @ solve_mat
+
+        # Update lower-bound tracker.
+        l = l * (a + b * l2) / (1.0 + c * l2)
+        l = min(max(l, 1e-3), 1.0)
+
+    if transposed:
+        X = X.T
+
+    return X.to(orig_dtype)
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
@@ -1078,7 +1177,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+
+    if args.use_optimized_muon:
+        # Use the optimized version:
+        zeropower_via_newtonschulz5 = gram_halley_step
+    else:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
